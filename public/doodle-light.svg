@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="260" viewBox="0 0 260 260">
+  <g fill="none" stroke="#54656f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.08">
+    <!-- music note -->
+    <line x1="66" y1="40" x2="66" y2="78"/>
+    <circle cx="58" cy="78" r="8"/>
+    <path d="M66 40q14 2 18 14"/>
+    <!-- chat bubble -->
+    <rect x="160" y="30" width="52" height="36" rx="10"/>
+    <path d="M172 66l6 12 10-12"/>
+    <!-- smiley -->
+    <circle cx="62" cy="160" r="18"/>
+    <circle cx="55" cy="154" r="2.2" fill="#54656f"/>
+    <circle cx="69" cy="154" r="2.2" fill="#54656f"/>
+    <path d="M53 164q9 8 18 0"/>
+    <!-- star -->
+    <path d="M182 142l5 10 11 1.6-8 7.8 1.9 11-9.9-5.2-9.9 5.2 1.9-11-8-7.8 11-1.6z"/>
+    <!-- heart -->
+    <path d="M130 222c-9-6-16-11-16-18a8 8 0 0 1 16-2.5 8 8 0 0 1 16 2.5c0 7-7 12-16 18z"/>
+    <!-- music note small -->
+    <g transform="translate(180,210) scale(0.7)">
+      <line x1="10" y1="0" x2="10" y2="38"/>
+      <circle cx="2" cy="38" r="8"/>
+      <path d="M10 0q14 2 18 14"/>
+    </g>
+    <!-- chat bubble small -->
+    <g transform="translate(28,224) scale(0.7)">
+      <rect x="0" y="0" width="52" height="36" rx="10"/>
+      <path d="M12 36l6 12 10-12"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,10 @@
+# Render blueprint — enables one-click "Deploy to Render"
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: a-chat
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
