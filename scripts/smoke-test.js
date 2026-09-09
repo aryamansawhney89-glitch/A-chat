@@ -369,6 +369,39 @@ function makeWavDataUrl() {
 
     carol.close();
 
+    console.log('\n— session restore (reopen) —');
+    // Register a user, then simulate closing + reopening the tab: a NEW
+    // connection that immediately joins with the stored {name, token}
+    // (what the client sends from connect() onopen after restoring state).
+    const zed = new Client('Zed');
+    await zed.connect();
+    zed.send({ type: 'register', username: 'Zed', password: 'zedpass1' });
+    const zedAuth = await zed.waitFor('auth_ok');
+    zed.send({ type: 'join', name: zedAuth.username, token: zedAuth.token });
+    await zed.waitFor('joined');
+    zed.close(); // close the tab
+    await sleep(200);
+
+    const zedAgain = new Client('ZedAgain');
+    await zedAgain.connect();
+    zedAgain.send({ type: 'join', name: 'Zed', token: zedAuth.token });
+    const rejoin = await zedAgain.waitFor('joined');
+    ok('reopen with stored session token rejoins as same user', rejoin.name === 'Zed');
+    ok(
+      'rejoin payload carries users/groups/rooms for render',
+      Array.isArray(rejoin.users) && Array.isArray(rejoin.groups) && Array.isArray(rejoin.rooms)
+    );
+    zedAgain.close();
+
+    // Stale token (e.g. server restarted, sessions wiped) must still join by
+    // name rather than leaving the client stranded on a black screen.
+    const stale = new Client('Stale');
+    await stale.connect();
+    stale.send({ type: 'join', name: 'Zed', token: 'dead-token-123' });
+    const staleJoin = await stale.waitFor('joined');
+    ok('join with stale token falls back to name', staleJoin.name === 'Zed');
+    stale.close();
+
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
     ok('messages.json persisted', fs.existsSync(path.join(dataDir, 'messages.json')));

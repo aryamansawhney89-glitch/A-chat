@@ -1544,6 +1544,7 @@ document.documentElement.dataset.theme = localStorage.getItem('achat-theme') || 
 themeBtn.textContent = document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
 
 logoutBtn.addEventListener('click', () => {
+  localStorage.removeItem('achat-token');
   localStorage.removeItem('achat-name');
   location.reload();
 });
@@ -1723,10 +1724,17 @@ document.addEventListener('keydown', (e) => {
 
 /* ------------------------------ initial screen ------------------------------ */
 
-// Show auth screen by default (unless we have a stored token)
+// Show auth screen by default (unless we have a stored session)
 if (storedToken && storedName) {
+  // Restore the saved session BEFORE connect(): onopen only auto-joins when
+  // state.authenticated is set, otherwise no join is ever sent and the app
+  // stays on a black screen (auth hidden, chat never rendered).
+  state.authenticated = true;
+  state.authToken = storedToken;
+  state.authUsername = storedName;
+  state.me = storedName;
   authScreen.classList.add('hidden');
-  // Will auto-auth via connect() onopen
+  // connect() onopen will send the join below
 } else {
   authScreen.classList.remove('hidden');
   authUsernameInput.value = storedName || '';
