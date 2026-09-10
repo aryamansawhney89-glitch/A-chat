@@ -1395,3 +1395,58 @@ html[data-theme="dark"] .reply-bar .rb-title { color: var(--accent); }
 }
 .picker-action:hover { background: var(--hover); }
 .picker-action .pa-icon { font-size: 14px; }
+
+/* ---------------- Group / room info panel ---------------- */
+
+/* the header title + avatar become tappable for groups and rooms */
+.chat-header.infoable .chat-meta,
+.chat-header.infoable > .avatar { cursor: pointer; }
+
+.chat-info-body { display: flex; flex-direction: column; gap: 10px; }
+.ci-hero { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 0 2px; }
+.ci-avatar {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  font-size: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  background-size: cover;
+  background-position: center;
+}
+.ci-title { font-size: 18px; font-weight: 600; }
+.ci-sub { font-size: 12.5px; color: var(--text-soft); }
+.ci-created { text-align: center; font-size: 12.5px; color: var(--text-soft); }
+.ci-invite {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--input-bg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+}
+.ci-invite b { letter-spacing: 1px; }
+.ci-invite .btn { padding: 4px 10px; font-size: 12.5px; }
+
+.ci-members { display: flex; flex-direction: column; max-height: 260px; overflow-y: auto; }
+.ci-member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.ci-member:last-child { border-bottom: none; }
+.ci-member-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ci-member-name { font-size: 14.5px; display: inline-flex; align-items: center; gap: 6px; }
+.ci-crown { font-size: 12px; }
+.ci-member-status { font-size: 12px; color: var(--text-soft); }
+.ci-member-status.online { color: var(--accent); }
+
+/* disabled rows in the add-to-call picker */
+.gm-member.disabled { opacity: 0.5; cursor: not-allowed; }
+.gm-member.disabled input { pointer-events: none; }

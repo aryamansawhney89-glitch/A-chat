@@ -10,8 +10,10 @@
  *   end-to-end, history callKind, voice default) → message replies (quote
  *   snapshots, group replies, tombstones) → message edits (ownership, blank
  *   rejection, history persistence) → message deletes (ownership, tombstone,
- *   reactions wiped, edit/react-after-delete rejected) → oversized upload
- *   rejected → JSON persistence (with legacy messages.json migration).
+ *   reactions wiped, edit/react-after-delete rejected) → group calls (multi-ring,
+ *   partial decline, member added mid-call via call_add, leave lifecycle, call
+ *   log) → oversized upload rejected → JSON persistence (with legacy
+ *   messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
  */
@@ -688,6 +690,94 @@ function makeWavDataUrl() {
     ok('normalised call declines cleanly', true);
     vera.close();
     victor.close();
+
+    console.log('\n— group calls + adding people mid-call —');
+    // Fresh members: Chloe + Dave join up front so the server knows their profiles
+    const chloe = new Client('Chloe');
+    const daveFirst = new Client('DaveFirst');
+    await chloe.connect();
+    await daveFirst.connect();
+    chloe.send({ type: 'join', name: 'Chloe' });
+    daveFirst.send({ type: 'join', name: 'Dave' });
+    await chloe.waitFor('joined');
+    await daveFirst.waitFor('joined');
+
+    alice.send({ type: 'group_create', name: 'Call Crew', members: ['Bob', 'Chloe', 'Dave'] });
+    const crew = await alice.waitFor('group_created', (e) => e.group.name === 'Call Crew');
+    const crewId = crew.group.id;
+    ok('group payload carries createdBy/createdAt for the info panel',
+      crew.group.createdBy === 'Alice' && Number.isFinite(crew.group.createdAt), JSON.stringify(crew.group));
+
+    // Dave goes offline before the call starts → he is not rung initially
+    daveFirst.close();
+    await sleep(300);
+    alice.send({ type: 'call_invite', convoId: crewId, kind: 'voice' });
+    const crewCall = await alice.waitFor('call_created', (e) => e.convoId === crewId);
+    ok('group call rings every online human member (offline one skipped)',
+      crewCall.callees.includes('Bob') && crewCall.callees.includes('Chloe') && crewCall.callees.length === 2,
+      JSON.stringify(crewCall.callees));
+    const crewCallId = crewCall.callId;
+    const chloeRing = await chloe.waitFor('call_invite', (e) => e.callId === crewCallId);
+    ok('group invite carries the group convo + kind', chloeRing.convoId === crewId && chloeRing.kind === 'voice' && chloeRing.from === 'Alice');
+
+    // Chloe answers, Bob declines — the call goes on with the two of them
+    chloe.send({ type: 'call_accept', callId: crewCallId });
+    const chloeIn = await chloe.waitFor('call_join', (e) => e.callId === crewCallId && e.isYou);
+    ok('first answerer joins the group call', chloeIn.peers.includes('Alice'));
+    bob.send({ type: 'call_reject', callId: crewCallId });
+    await alice.waitFor('call_declined', (e) => e.callId === crewCallId && e.from === 'Bob');
+    const aliceMarkAfterDecline = alice.events.length;
+    await sleep(300);
+    ok('one member declining does not end a group call',
+      !alice.events.slice(aliceMarkAfterDecline).some((e) => e.type === 'call_ended' && e.callId === crewCallId));
+
+    // Dave comes back online and Alice pulls him into the live call
+    const daveBack = new Client('DaveBack');
+    await daveBack.connect();
+    daveBack.send({ type: 'join', name: 'Dave' });
+    await daveBack.waitFor('joined');
+    alice.send({ type: 'call_add', callId: crewCallId, to: ['Dave'] });
+    const daveRing = await daveBack.waitFor('call_invite', (e) => e.callId === crewCallId);
+    ok('member offline at call start can be added to an ongoing call', daveRing.from === 'Alice' && daveRing.kind === 'voice');
+    const ringNote = await alice.waitFor('call_peer_ringing', (e) => e.callId === crewCallId);
+    ok('existing talkers are told who is being rung', (ringNote.names || []).includes('Dave'));
+
+    daveBack.send({ type: 'call_accept', callId: crewCallId });
+    const daveIn = await daveBack.waitFor('call_join', (e) => e.callId === crewCallId && e.isYou);
+    ok('added member gets the full mesh of peers', daveIn.peers.includes('Alice') && daveIn.peers.includes('Chloe'),
+      JSON.stringify(daveIn.peers));
+    await alice.waitFor('call_join', (e) => e.callId === crewCallId && e.offerTo === 'Dave');
+    await chloe.waitFor('call_join', (e) => e.callId === crewCallId && e.offerTo === 'Dave');
+    ok('everyone already in the call offers to the late joiner', true);
+
+    // guards: adding a bot / someone already in / a stranger changes nothing
+    const chloeMark = chloe.events.length;
+    alice.send({ type: 'call_add', callId: crewCallId, to: ['Aria', 'Dave', 'Ghost'] });
+    await sleep(300);
+    ok('bot / duplicate / non-member add targets are ignored',
+      !chloe.events.slice(chloeMark).some((e) => e.type === 'call_peer_ringing'));
+
+    // Chloe hangs up — Alice and Dave keep talking
+    chloe.send({ type: 'call_leave', callId: crewCallId });
+    await daveBack.waitFor('call_peer_left', (e) => e.callId === crewCallId && e.name === 'Chloe');
+    const aliceMarkAfterLeave = alice.events.length;
+    await sleep(300);
+    ok('group call continues while 2+ members remain',
+      !alice.events.slice(aliceMarkAfterLeave).some((e) => e.type === 'call_ended' && e.callId === crewCallId));
+
+    // Dave hangs up — Alice is alone → call ends and is logged
+    daveBack.send({ type: 'call_leave', callId: crewCallId });
+    const crewEnd = await alice.waitFor('call_ended', (e) => e.callId === crewCallId);
+    ok('call ends when fewer than 2 talkers remain', crewEnd.reason === 'ended', JSON.stringify(crewEnd));
+    alice.send({ type: 'history', convoId: crewId });
+    const crewHist = await alice.waitFor('history', (e) => e.convoId === crewId && (e.messages || []).some((m) => m.kind === 'call'));
+    const crewLog = crewHist.messages.filter((m) => m.kind === 'call').pop();
+    ok('group call log lists everyone who picked up',
+      crewLog.media.members.includes('Alice') && crewLog.media.members.includes('Chloe') && crewLog.media.members.includes('Dave'),
+      JSON.stringify(crewLog.media.members));
+
+    chloe.close();
+    daveBack.close();
 
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save

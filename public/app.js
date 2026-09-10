@@ -472,6 +472,8 @@ function handle(msg) {
       if (!activeCall.convoId) break;
       activeCall.id = msg.callId;
       if (msg.kind === 'video' || msg.kind === 'voice') activeCall.kind = msg.kind;
+      activeCall.ringing = new Set(msg.callees || []);
+      activeCall.declined = new Set();
       activeCall.status = 'calling';
       setCallStatus('Ringing…');
       break;
@@ -494,6 +496,7 @@ function handle(msg) {
 
     case 'call_join': {
       if (!activeCall.id || activeCall.id !== msg.callId) break;
+      if (msg.name) { activeCall.ringing.delete(msg.name); activeCall.declined.delete(msg.name); }
       if (msg.isYou) {
         // we just got in; everyone already there sends us an offer
         activeCall.status = 'connected';
@@ -520,12 +523,27 @@ function handle(msg) {
 
     case 'call_peer_left': {
       if (!activeCall.id || activeCall.id !== msg.callId) break;
+      activeCall.ringing.delete(msg.name);
       onCallPeerLeft(msg.name);
       break;
     }
 
     case 'call_declined': {
+      activeCall.ringing.delete(msg.from);
+      activeCall.declined.add(msg.from);
       if (activeCall.convoId || state.incoming) toast(`${msg.from} declined the call`);
+      break;
+    }
+
+    case 'call_peer_ringing': {
+      // someone on the call pulled more people in — show who is being rung
+      if (!activeCall.id || activeCall.id !== msg.callId) break;
+      const names = (msg.names || []).filter(Boolean);
+      for (const n of names) activeCall.ringing.add(n);
+      if (names.length) {
+        toast(`Ringing ${names.join(', ')}…`);
+        setCallStatus(`Ringing ${names.join(', ')}…`);
+      }
       break;
     }
 
@@ -815,6 +833,7 @@ function updateActiveHeader() {
   if (!state.active) return;
   const meta = metaFor(state.active);
   if (!meta) return;
+  chatHeaderEl.classList.toggle('infoable', meta.kind !== 'dm'); // title/avatar opens group/room info
   if (meta.kind === 'group') {
     if (chatStatus.dataset.typing === '1') return;
     const others = meta.members.filter((n) => n !== state.me);
@@ -1795,6 +1814,12 @@ const muteBtn = $('muteBtn');
 const cameraBtn = $('cameraBtn');
 const endCallBtn = $('endCallBtn');
 const speakerBtn = $('speakerBtn');
+const addToCallBtn = $('addToCallBtn');
+const addToCallModal = $('addToCallModal');
+const addToCallMembers = $('addToCallMembers');
+const addToCallCloseBtn = $('addToCallCloseBtn');
+const addToCallCancelBtn = $('addToCallCancelBtn');
+const addToCallSubmitBtn = $('addToCallSubmitBtn');
 
 // STUN only — media flows straight between browsers. Peers behind symmetric
 // NATs (no TURN server here) may fail to connect; the UI says so.
@@ -1813,6 +1838,8 @@ const activeCall = {
   startedAt: 0,
   timer: null,
   peers: new Map(),    // name -> {pc, audio, tile, pending[]}
+  ringing: new Set(),  // names we know are being rung right now (caller side)
+  declined: new Set(), // names that declined this call
   localStream: null,
   localTile: null,
   muted: false,
@@ -2046,8 +2073,92 @@ function showCallOverlay() {
   updateMuteBtn();
   updateCameraBtn();
   updateSpeakerBtn();
+  updateAddToCallBtn();
   renderCallPeers();
 }
+
+// The 👤+ button only makes sense for group/room calls (in a DM everyone is
+// already in the call) — and only while a call is actually live.
+function updateAddToCallBtn() {
+  const meta = activeCall.convoId ? metaFor(activeCall.convoId) : null;
+  const show = !!activeCall.convoId && !!meta && meta.kind !== 'dm';
+  addToCallBtn.classList.toggle('hidden', !show);
+}
+
+// Who could still be pulled in: human convo members, not me, not already
+// joined/ringing, and (greyed out) those offline or who already declined.
+function addableCallMembers() {
+  const meta = activeCall.convoId ? metaFor(activeCall.convoId) : null;
+  if (!meta) return [];
+  return meta.members
+    .filter((n) => n !== state.me && !findUserBy(n, (u) => u.bot))
+    .map((n) => {
+      const u = findUser(n);
+      return {
+        name: n,
+        pic: u ? u.pic : null,
+        online: !!(u && u.online),
+        joined: activeCall.peers.has(n),
+        declined: !!(activeCall.declined && activeCall.declined.has(n)),
+        ringing: !!(activeCall.ringing && activeCall.ringing.has(n)),
+      };
+    });
+}
+
+function openAddToCallModal() {
+  if (!activeCall.id) return;
+  addToCallMembers.innerHTML = '';
+  const candidates = addableCallMembers().filter((c) => !c.joined && !c.declined && !c.ringing);
+  let any = false;
+  for (const c of candidates) {
+    const row = document.createElement('label');
+    row.className = 'gm-member' + (c.online ? '' : ' disabled');
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = c.name;
+    cb.disabled = !c.online;
+
+    const av = document.createElement('div');
+    av.className = 'avatar';
+    applyAvatar(av, c.name, c.pic);
+
+    const nameEl = document.createElement('span');
+    nameEl.textContent = c.name;
+
+    const status = document.createElement('span');
+    status.className = 'gm-status';
+    status.textContent = c.online ? 'online' : 'offline';
+
+    row.append(cb, av, nameEl, status);
+    addToCallMembers.appendChild(row);
+    any = true;
+  }
+  if (!any) {
+    const note = document.createElement('div');
+    note.className = 'list-note';
+    note.textContent = 'Nobody else is available to join right now.';
+    addToCallMembers.appendChild(note);
+  }
+  addToCallSubmitBtn.disabled = false;
+  addToCallModal.classList.remove('hidden');
+}
+
+function closeAddToCallModal() {
+  addToCallModal.classList.add('hidden');
+  addToCallSubmitBtn.disabled = false;
+}
+
+addToCallBtn.addEventListener('click', openAddToCallModal);
+addToCallCloseBtn.addEventListener('click', closeAddToCallModal);
+addToCallCancelBtn.addEventListener('click', closeAddToCallModal);
+addToCallSubmitBtn.addEventListener('click', () => {
+  if (!activeCall.id) { closeAddToCallModal(); return; }
+  const names = [...addToCallMembers.querySelectorAll('input[type="checkbox"]:checked')].map((cb) => cb.value);
+  if (!names.length) { toast('Pick at least one person'); return; }
+  wsSend({ type: 'call_add', callId: activeCall.id, to: names });
+  closeAddToCallModal();
+});
 
 function callKindWord() {
   return activeCall.kind === 'video' ? 'video call' : 'voice call';
@@ -2221,11 +2332,14 @@ function teardownCall() {
   activeCall.cameraOff = false;
   activeCall.speaker = false;
   activeCall.sinkId = null;
+  activeCall.ringing = new Set();
+  activeCall.declined = new Set();
   callCardEl.classList.remove('video');
   callVideoGrid.classList.add('hidden');
   cameraBtn.classList.add('hidden');
   callOverlay.classList.add('hidden');
   callPeersEl.innerHTML = '';
+  closeAddToCallModal();
   hideIncoming();
   stopRing();
   state.incoming = null;
@@ -2424,6 +2538,118 @@ groupCreateBtn.addEventListener('click', async () => {
   } catch (err) {
     toast(err.message || 'Upload failed');
     groupCreateBtn.disabled = false;
+  }
+});
+
+/* --------------------- group / room info panel (tap chat title) ------------ */
+
+const chatInfoModal = $('chatInfoModal');
+const chatInfoKind = $('chatInfoKind');
+const chatInfoAvatar = $('chatInfoAvatar');
+const chatInfoTitle = $('chatInfoTitle');
+const chatInfoSub = $('chatInfoSub');
+const chatInfoCreated = $('chatInfoCreated');
+const chatInfoInviteWrap = $('chatInfoInviteWrap');
+const chatInfoInvite = $('chatInfoInvite');
+const chatInfoCopyBtn = $('chatInfoCopyBtn');
+const chatInfoMembersLabel = $('chatInfoMembersLabel');
+const chatInfoMembers = $('chatInfoMembers');
+const chatInfoCloseBtn = $('chatInfoCloseBtn');
+const chatHeaderEl = document.querySelector('.chat-header');
+const chatMetaEl = document.querySelector('.chat-meta');
+
+function infoMemberRow(name, creator) {
+  const u = findUser(name);
+  const row = document.createElement('div');
+  row.className = 'ci-member';
+
+  const av = document.createElement('div');
+  av.className = 'avatar';
+  applyAvatar(av, name, u ? u.pic : null);
+
+  const body = document.createElement('div');
+  body.className = 'ci-member-body';
+  const nameEl = document.createElement('span');
+  nameEl.className = 'ci-member-name';
+  nameEl.textContent = name === state.me ? `${name} (you)` : name;
+  if (u && u.bot) {
+    const tag = document.createElement('span');
+    tag.className = 'bot-tag';
+    tag.textContent = 'BOT';
+    nameEl.appendChild(tag);
+  }
+  if (name === creator) {
+    const crown = document.createElement('span');
+    crown.className = 'ci-crown';
+    crown.title = 'Group creator';
+    crown.textContent = '👑';
+    nameEl.appendChild(crown);
+  }
+  const statusEl = document.createElement('span');
+  statusEl.className = 'ci-member-status' + (u && u.online ? ' online' : '');
+  statusEl.textContent = u && u.online ? 'online'
+    : u && u.lastSeen ? `last seen ${listTime(u.lastSeen)}`
+    : 'offline';
+  body.append(nameEl, statusEl);
+
+  row.append(av, body);
+  return row;
+}
+
+function openChatInfo() {
+  if (!state.active) return;
+  const meta = metaFor(state.active);
+  if (!meta || meta.kind === 'dm') return; // groups and rooms only
+
+  const isRoom = meta.kind === 'room';
+  chatInfoKind.textContent = isRoom ? 'Room info' : 'Group info';
+  applyAvatar(chatInfoAvatar, isRoom ? meta.room.id : (meta.group ? meta.group.id : meta.title), meta.pic, isRoom ? '🔒' : '👥');
+  chatInfoTitle.textContent = meta.title;
+  chatInfoSub.textContent = `${isRoom ? 'Room' : 'Group'} · ${meta.members.length} member${meta.members.length === 1 ? '' : 's'}`;
+
+  const creator = isRoom ? meta.room.createdBy : (meta.group && meta.group.createdBy);
+  const createdAt = isRoom ? meta.room.createdAt : (meta.group && meta.group.createdAt);
+  let line = '';
+  if (creator) line += `Created by ${creator === state.me ? 'you' : creator}`;
+  if (createdAt) line += `${line ? ' · ' : ''}${new Date(createdAt).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`;
+  chatInfoCreated.textContent = line;
+  chatInfoCreated.classList.toggle('hidden', !line);
+
+  if (isRoom && meta.room.inviteCode) {
+    chatInfoInviteWrap.classList.remove('hidden');
+    chatInfoInvite.textContent = meta.room.inviteCode;
+  } else {
+    chatInfoInviteWrap.classList.add('hidden');
+  }
+
+  chatInfoMembersLabel.textContent = `${meta.members.length} member${meta.members.length === 1 ? '' : 's'}`;
+  chatInfoMembers.innerHTML = '';
+  const sorted = [...meta.members].sort((a, b) => {
+    if (a === creator) return -1;
+    if (b === creator) return 1;
+    const ua = findUser(a); const ub = findUser(b);
+    const onA = ua && ua.online ? 0 : 1;
+    const onB = ub && ub.online ? 0 : 1;
+    return (onA - onB) || a.localeCompare(b);
+  });
+  for (const n of sorted) chatInfoMembers.appendChild(infoMemberRow(n, creator));
+
+  chatInfoModal.classList.remove('hidden');
+}
+
+function closeChatInfo() {
+  chatInfoModal.classList.add('hidden');
+}
+
+chatInfoCloseBtn.addEventListener('click', closeChatInfo);
+chatMetaEl.addEventListener('click', openChatInfo);        // tap the chat title/status
+chatAvatar.addEventListener('click', openChatInfo);        // or the header avatar
+chatInfoCopyBtn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(chatInfoInvite.textContent);
+    toast('Invite code copied! 📋');
+  } catch {
+    toast('Select and copy the code');
   }
 });
 
@@ -2641,6 +2867,8 @@ document.addEventListener('keydown', (e) => {
     closeJoinRoomModal();
     closeInviteModal();
     closeReactionPicker();
+    closeChatInfo();
+    closeAddToCallModal();
     cancelMessageAction(false); // cancel a pending reply / edit
   }
 });

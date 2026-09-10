@@ -1061,6 +1061,47 @@ function handle(ws, msg) {
       break;
     }
 
+    // Pull more conversation members into a call that is already ringing or
+    // connected. Only someone who has joined can add; targets must be online,
+    // free, human members of the conversation who were not already rung.
+    case 'call_add': {
+      const me = ws.userName;
+      const call = calls.get(String(msg.callId || ''));
+      if (!me || !call || call.ended || !call.joined.includes(me)) return;
+      const wanted = (Array.isArray(msg.to) ? msg.to : [msg.to]).map((n) => String(n || '')).slice(0, CALL_MAX_MEMBERS);
+      const added = [];
+      for (const name of wanted) {
+        if (!name || isBot(name)) continue;
+        if (!convoParticipants(call.convoId).includes(name)) continue;
+        if (call.joined.includes(name) || call.ringing.has(name) || call.declined.has(name)) continue;
+        if (!clients.has(name) || userInCall(name)) continue;
+        if (callMembers(call).size >= CALL_MAX_MEMBERS) break;
+        call.ringing.add(name);
+        added.push(name);
+      }
+      if (!added.length) return;
+      const kind = call.kind === 'video' ? 'video' : 'voice';
+      for (const n of added) {
+        sendCall(n, { type: 'call_invite', callId: call.id, convoId: call.convoId, kind, from: me, callees: added });
+      }
+      // let everyone already talking know who is being rung
+      for (const n of call.joined) {
+        sendCall(n, { type: 'call_peer_ringing', callId: call.id, names: added });
+      }
+      // late invitees get their own ring timeout (the initial ring phase has a
+      // shared timer; a connected call does not) so nobody rings forever.
+      const batch = [...added];
+      setTimeout(() => {
+        if (call.ended) return;
+        for (const n of batch) {
+          if (call.ringing.delete(n)) {
+            sendCall(n, { type: 'call_cancelled', callId: call.id, reason: 'timeout' });
+          }
+        }
+      }, CALL_RING_TIMEOUT_MS + 500);
+      break;
+    }
+
     case 'register': {
       const username = String(msg.username || '').trim().replace(/\s+/g, ' ').slice(0, 24);
       const password = String(msg.password || '');
