@@ -42,7 +42,7 @@ const BOTS = [
         'Hi {u}! Great to see you on A-Chat 💬',
       ] },
       { keys: ['help', 'feature', 'how'], replies: [
-        'Here is what A-Chat can do: realtime messaging, voice calls 📞, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, message reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press any message to react to it!',
+        'Here is what A-Chat can do: realtime messaging, voice 📞 and video 🎥 calls, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, message reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press any message to react to it!',
       ] },
       { keys: ['group', 'invite'], replies: [
         'Groups are here! 👥 Tap the 👥 button in the sidebar, pick a name, a picture (optional) and tick the members you want.',
@@ -528,17 +528,22 @@ function maybeBotReact(convoId, m) {
   }
 }
 
-/* ------------------------------ voice calls -------------------------------- */
+/* --------------------------- voice & video calls ---------------------------- */
 
 /* WebRTC calls are peer-to-peer; the server only relays signalling.
  *
  *   client                          server                         client
- *     |--- call_invite {convoId} -->|                                 |
- *     |<-- call_created {callId} ---|--- call_invite {callId} ------->|  (rings)
+ *     |--- call_invite {convoId, kind} ->|                                 |
+ *     |<-- call_created {callId, kind} --|--- call_invite {callId, kind} -->|  (rings)
  *     |                             |<-- call_accept {callId} --------|
  *     |<-- call_join {offerTo:B} ---|--- call_join {isYou, peers} --->|
  *     |<========= call_signal {sdp|candidate} relayed both ways =====>|
  *     |--- call_leave {callId} ---->|--- call_ended + call log ------>|
+ *
+ * kind is 'voice' or 'video' (anything else is normalised to 'voice'). It
+ * travels on call_created/call_invite/call_join/call_ended and is stored on
+ * the logged history entry as media.callKind so old entries (no callKind)
+ * still render as voice calls.
  *
  * The participant who joined the call *first* always creates the SDP offer for
  * a newer participant, so two peers never create offers at the same time.
@@ -575,6 +580,7 @@ function logCallMessage(call, status, duration) {
     id: nextId++, convoId: call.convoId, from: call.initiator, kind: 'call', text: '',
     media: {
       status,
+      callKind: call.kind === 'video' ? 'video' : 'voice',
       duration: Math.min(86400, Math.max(0, duration)),
       members: [...call.participants].sort(),
     },
@@ -598,8 +604,9 @@ function endCall(call, reason) {
   clearTimeout(call.timer);
   calls.delete(call.id);
   const duration = callDuration(call);
+  const kind = call.kind === 'video' ? 'video' : 'voice';
   for (const n of callMembers(call)) {
-    sendCall(n, { type: 'call_ended', callId: call.id, convoId: call.convoId, reason, duration });
+    sendCall(n, { type: 'call_ended', callId: call.id, convoId: call.convoId, kind, reason, duration });
   }
   const status = call.startedAt
     ? 'completed'
@@ -669,9 +676,11 @@ function startCall(ws, msg) {
     send(ws, { type: 'call_failed', convoId, reason: 'busy' });
     return;
   }
+  const kind = msg.kind === 'video' ? 'video' : 'voice';
   const call = {
     id: newCallId(),
     convoId,
+    kind,
     initiator: from,
     ringing: new Set(free),
     joined: [from],
@@ -684,9 +693,9 @@ function startCall(ws, msg) {
   };
   calls.set(call.id, call);
   call.timer = setTimeout(() => onRingTimeout(call), CALL_RING_TIMEOUT_MS);
-  send(ws, { type: 'call_created', callId: call.id, convoId, callees: free });
+  send(ws, { type: 'call_created', callId: call.id, convoId, kind, callees: free });
   for (const n of free) {
-    sendCall(n, { type: 'call_invite', callId: call.id, convoId, from, callees: free });
+    sendCall(n, { type: 'call_invite', callId: call.id, convoId, kind, from, callees: free });
   }
 }
 
@@ -697,13 +706,14 @@ function acceptCall(call, name) {
   call.participants.add(name);
   if (call.startedAt === null) call.startedAt = Date.now();
   // The newcomer only answers offers; everyone already in the call offers to them.
+  const kind = call.kind === 'video' ? 'video' : 'voice';
   sendCall(name, {
-    type: 'call_join', callId: call.id, convoId: call.convoId, name, initiator: call.initiator,
+    type: 'call_join', callId: call.id, convoId: call.convoId, kind, name, initiator: call.initiator,
     isYou: true, peers: existing, members: [...call.joined],
   });
   for (const n of existing) {
     sendCall(n, {
-      type: 'call_join', callId: call.id, convoId: call.convoId, name, initiator: call.initiator,
+      type: 'call_join', callId: call.id, convoId: call.convoId, kind, name, initiator: call.initiator,
       isYou: false, offerTo: name, members: [...call.joined],
     });
   }
