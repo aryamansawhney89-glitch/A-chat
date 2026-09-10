@@ -10,6 +10,11 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 - **WhatsApp Web UI** — chat list, message bubbles with tails, date separators, ✓ / ✓✓ / blue-tick receipts
 - **Password-protected rooms 🔒** — create a room with a name and password; join with the password or a 6-character invite code; share invite codes with others
 - **Message reactions 😍** — long-press (or right-click) any message to react with emoji; bots also react to your messages; click a reaction chip to toggle yours
+- **Message replies, edits & deletes ↩️✏️🗑️** — swipe a message (or use the long-press
+  menu) to reply with a quoted snapshot you can tap to jump back to the original; edit
+  your own texts and photo captions in place (tagged "edited"); delete your own
+  messages for everyone — the bubble becomes a "This message was deleted" tombstone
+  with text, media and reactions wiped, persisted across reloads
 - **Group chats 👥** — "New group" modal with name, optional group picture and member
   checkboxes; group messages show colored sender names; delivery/read ticks aggregate
   across all members

@@ -42,7 +42,7 @@ const BOTS = [
         'Hi {u}! Great to see you on A-Chat 💬',
       ] },
       { keys: ['help', 'feature', 'how'], replies: [
-        'Here is what A-Chat can do: realtime messaging, voice 📞 and video 🎥 calls, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, message reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press any message to react to it!',
+        'Here is what A-Chat can do: realtime messaging, voice 📞 and video 🎥 calls, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, replies ↩️, message edits ✏️ and deletes 🗑️, reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press or right-click any message to react, reply, edit or delete — or swipe a message to reply!',
       ] },
       { keys: ['group', 'invite'], replies: [
         'Groups are here! 👥 Tap the 👥 button in the sidebar, pick a name, a picture (optional) and tick the members you want.',
@@ -231,17 +231,22 @@ function normalizeConvoId(key) {
 function migrateMessage(m, convoId) {
   if (!m || !m.from) return null;
   const others = convoParticipants(convoId).filter((p) => p !== m.from);
+  const deleted = m.deleted === true;
   return {
     id: m.id,
     convoId,
     from: m.from,
     kind: m.kind || 'text',
-    text: m.text || '',
-    media: m.media || null,
+    text: deleted ? '' : (m.text || ''),
+    media: deleted ? null : (m.media || null),
     ts: m.ts || Date.now(),
     deliveredBy: Array.isArray(m.deliveredBy) ? m.deliveredBy : (m.delivered ? others : []),
     readBy: Array.isArray(m.readBy) ? m.readBy : (m.read ? others : []),
-    reactions: m.reactions && typeof m.reactions === 'object' ? m.reactions : {},
+    reactions: deleted ? {} : (m.reactions && typeof m.reactions === 'object' ? m.reactions : {}),
+    // message actions: quote snapshot, edit marker, delete-for-everyone tombstone
+    replyTo: !deleted && m.replyTo && typeof m.replyTo === 'object' && typeof m.replyTo.id === 'number' ? m.replyTo : null,
+    editedAt: Number.isFinite(m.editedAt) ? m.editedAt : null,
+    deleted,
   };
 }
 
@@ -427,6 +432,32 @@ function sanitizeMedia(media, kind) {
   return out;
 }
 
+// Snapshot of a replied-to message, attached to the reply so the quote still
+// renders sensibly even after the original scrolls out of history or is
+// deleted (a reply to a deleted message keeps a tombstone snapshot).
+// Clients may reference the original by bare id or by passing the message.
+function sanitizeReplyTo(convoId, ref) {
+  const id = typeof ref === 'number' ? ref : (ref && typeof ref.id === 'number' ? ref.id : null);
+  if (id === null) return null;
+  const msgs = conversations.get(convoId) || [];
+  const target = msgs.find((x) => x.id === id);
+  if (!target) return null;
+  if (target.deleted) {
+    return { id: target.id, from: target.from, kind: 'text', text: '', deleted: true };
+  }
+  const snap = {
+    id: target.id,
+    from: target.from,
+    kind: target.kind || 'text',
+    text: String(target.text || '').slice(0, 140),
+  };
+  if (snap.kind === 'call' && target.media) {
+    snap.callKind = target.media.callKind === 'video' ? 'video' : 'voice';
+    snap.status = String(target.media.status || 'completed');
+  }
+  return snap;
+}
+
 /* ---------------------------------- bots ---------------------------------- */
 
 const BOT_REACTIONS = {
@@ -458,7 +489,7 @@ function botReactToMessage(convoId, fromName) {
 function handleReact(convoId, reactor, messageId, emoji, add, silent) {
   const msgs = conversations.get(convoId) || [];
   const m = msgs.find((x) => x.id === messageId);
-  if (!m || !emoji) return null;
+  if (!m || !emoji || m.deleted) return null;
   if (!m.reactions) m.reactions = {};
   if (add) {
     if (!m.reactions[emoji]) m.reactions[emoji] = [];
@@ -485,6 +516,7 @@ function botSay(convoId, botName, text) {
   const m = {
     id: nextId++, convoId, from: botName, kind: 'text', text,
     media: null, ts: Date.now(), deliveredBy: [], readBy: [], reactions: {},
+    replyTo: null, editedAt: null, deleted: false,
   };
   for (const p of convoParticipants(convoId)) {
     if (p === botName) continue;
@@ -585,6 +617,7 @@ function logCallMessage(call, status, duration) {
       members: [...call.participants].sort(),
     },
     ts: Date.now(), deliveredBy: [], readBy: [], reactions: {},
+    replyTo: null, editedAt: null, deleted: false,
   };
   for (const p of convoParticipants(call.convoId)) {
     if (p === call.initiator) continue;
@@ -810,6 +843,7 @@ function handle(ws, msg) {
       const m = {
         id: nextId++, convoId, from, kind, text, media, ts: Date.now(),
         deliveredBy: [], readBy: [], reactions: {},
+        replyTo: sanitizeReplyTo(convoId, msg.replyTo), editedAt: null, deleted: false,
       };
       pushMessage(m);
       send(ws, { type: 'message', message: m }); // echo to sender (assigns id/ts)
@@ -943,6 +977,53 @@ function handle(ws, msg) {
       const ALLOWED_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🙏', '🔥', '🎉', '😍', '👎', '💯', '🤣'];
       if (!ALLOWED_REACTIONS.includes(emoji)) return;
       handleReact(convoId, from, messageId, emoji, add);
+      break;
+    }
+
+    // Edit one of your own messages (or a photo caption). Everyone in the
+    // conversation gets message_edited so bubbles update in place.
+    case 'edit': {
+      const from = ws.userName;
+      if (!from) return;
+      const convoId = String(msg.convoId || '');
+      const id = typeof msg.id === 'number' ? msg.id : null;
+      const text = String(msg.text || '').slice(0, 4000);
+      if (!convoId || id === null || !canAccess(convoId, from)) return;
+      const msgs = conversations.get(convoId) || [];
+      const m = msgs.find((x) => x.id === id);
+      if (!m || m.deleted || m.from !== from) return;      // your own messages only
+      if (m.kind !== 'text' && m.kind !== 'photo') return; // text bodies & photo captions
+      if (m.kind === 'text' && !text.trim()) return;
+      if ((m.text || '') === text) return;                 // no-op edit
+      m.text = text;
+      m.editedAt = Date.now();
+      scheduleSave();
+      for (const p of convoParticipants(convoId)) {
+        if (!isBot(p)) send(clients.get(p), { type: 'message_edited', convoId, id, text, editedAt: m.editedAt });
+      }
+      break;
+    }
+
+    // Delete for everyone: the message stays in history as a tombstone
+    // ("This message was deleted") with text/media/reactions wiped.
+    case 'delete': {
+      const from = ws.userName;
+      if (!from) return;
+      const convoId = String(msg.convoId || '');
+      const id = typeof msg.id === 'number' ? msg.id : null;
+      if (!convoId || id === null || !canAccess(convoId, from)) return;
+      const msgs = conversations.get(convoId) || [];
+      const m = msgs.find((x) => x.id === id);
+      if (!m || m.deleted || m.from !== from) return;      // your own messages only
+      m.deleted = true;
+      m.text = '';
+      m.media = null;
+      m.reactions = {};
+      m.replyTo = null;
+      scheduleSave();
+      for (const p of convoParticipants(convoId)) {
+        if (!isBot(p)) send(clients.get(p), { type: 'message_deleted', convoId, id });
+      }
       break;
     }
 

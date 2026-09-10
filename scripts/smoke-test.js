@@ -7,8 +7,11 @@
  *   aggregated receipts → photo upload + message (bot reacts) → voice upload
  *   + message (bot reacts) → profile picture broadcast → voice call signalling
  *   (invite/accept/SDP relay/hang-up/missed) → video call signalling (kind
- *   end-to-end, history callKind, voice default) → oversized upload rejected →
- *   JSON persistence (with legacy messages.json migration).
+ *   end-to-end, history callKind, voice default) → message replies (quote
+ *   snapshots, group replies, tombstones) → message edits (ownership, blank
+ *   rejection, history persistence) → message deletes (ownership, tombstone,
+ *   reactions wiped, edit/react-after-delete rejected) → oversized upload
+ *   rejected → JSON persistence (with legacy messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
  */
@@ -309,6 +312,111 @@ function makeWavDataUrl() {
     await sleep(300);
     const newReactEvents = alice.events.slice(eventsBefore).filter((e) => e.type === 'reaction' && e.id === reactTarget.message.id);
     ok('invalid emoji rejected (no reaction broadcast)', newReactEvents.length === 0);
+
+    console.log('\n— message replies —');
+    // Bob asks, Alice quotes him in her reply
+    bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'what is the plan?' });
+    const origQ = await alice.waitFor('message', (e) => e.message.text === 'what is the plan?');
+    alice.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'dinner at 8!', replyTo: origQ.message.id });
+    const replyB = await bob.waitFor('message', (e) => e.message.text === 'dinner at 8!');
+    ok(
+      'reply carries a replyTo snapshot of the original',
+      !!replyB.message.replyTo && replyB.message.replyTo.id === origQ.message.id &&
+        replyB.message.replyTo.from === 'Bob' && replyB.message.replyTo.text === 'what is the plan?',
+      JSON.stringify(replyB.message.replyTo)
+    );
+
+    // a replyTo pointing at nothing is dropped, message still goes through
+    bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'no parent here', replyTo: 424242 });
+    const bogus = await bob.waitFor('message', (e) => e.message.text === 'no parent here');
+    ok('unknown replyTo id ignored (message still sent)', !bogus.message.replyTo);
+
+    // replies also work in groups
+    bob.send({ type: 'message', convoId: gid, kind: 'text', text: 'group question' });
+    const gQ = await alice.waitFor('message', (e) => e.message.convoId === gid && e.message.text === 'group question');
+    alice.send({ type: 'message', convoId: gid, kind: 'text', text: 'group answer', replyTo: gQ.message.id });
+    const gReply = await bob.waitFor('message', (e) => e.message.convoId === gid && e.message.text === 'group answer');
+    ok('replies work in group chats', !!gReply.message.replyTo && gReply.message.replyTo.id === gQ.message.id);
+
+    console.log('\n— message edits —');
+    const beforeForeignEdit = bob.events.length;
+    bob.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: 'Bob should not edit this' });
+    await sleep(300);
+    ok(
+      'cannot edit someone else\'s message',
+      !bob.events.slice(beforeForeignEdit).some((e) => e.type === 'message_edited')
+    );
+
+    alice.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: 'dinner at 9!' });
+    const editedB = await bob.waitFor('message_edited', (e) => e.id === replyB.message.id);
+    ok('edit broadcast reaches the other side', editedB.text === 'dinner at 9!' && editedB.editedAt > 0);
+
+    alice.send({ type: 'history', convoId: dmAB });
+    const histAfterEdit = await alice.waitFor(
+      'history',
+      (e) => e.convoId === dmAB && (e.messages || []).some((m) => m.id === replyB.message.id && m.editedAt)
+    );
+    const editedMsg = histAfterEdit.messages.find((m) => m.id === replyB.message.id);
+    ok('history persists edited text + editedAt', editedMsg.text === 'dinner at 9!' && Number.isFinite(editedMsg.editedAt));
+
+    const beforeBlankEdit = alice.events.length;
+    alice.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: '   ' });
+    await sleep(300);
+    ok(
+      'blank edit of a text message rejected',
+      !alice.events.slice(beforeBlankEdit).some((e) => e.type === 'message_edited')
+    );
+
+    console.log('\n— message deletes —');
+    const beforeForeignDel = alice.events.length;
+    bob.send({ type: 'delete', convoId: dmAB, id: replyB.message.id });
+    await sleep(300);
+    ok(
+      'cannot delete someone else\'s message',
+      !alice.events.slice(beforeForeignDel).some((e) => e.type === 'message_deleted')
+    );
+
+    // a reaction on the message must vanish when the message is deleted
+    bob.send({ type: 'react', convoId: dmAB, id: replyB.message.id, emoji: '👍', add: true });
+    await alice.waitFor('reaction', (e) => e.id === replyB.message.id && (e.reactions['👍'] || []).includes('Bob'));
+
+    alice.send({ type: 'delete', convoId: dmAB, id: replyB.message.id });
+    const delB = await bob.waitFor('message_deleted', (e) => e.id === replyB.message.id);
+    ok('delete broadcast reaches the other side', !!delB);
+
+    alice.send({ type: 'history', convoId: dmAB });
+    const histAfterDel = await alice.waitFor(
+      'history',
+      (e) => e.convoId === dmAB && (e.messages || []).some((m) => m.id === replyB.message.id && m.deleted)
+    );
+    const delMsg = histAfterDel.messages.find((m) => m.id === replyB.message.id);
+    ok('history keeps a tombstone (text + media cleared)', delMsg.deleted === true && delMsg.text === '' && delMsg.media === null);
+    ok('reactions cleared on delete', !delMsg.reactions || Object.keys(delMsg.reactions).length === 0);
+
+    const beforeRevive = alice.events.length;
+    alice.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: 'back from the dead' });
+    await sleep(300);
+    ok(
+      'deleted message cannot be edited',
+      !alice.events.slice(beforeRevive).some((e) => e.type === 'message_edited')
+    );
+
+    // quoting a deleted message yields a tombstone snapshot
+    bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'what did it say?', replyTo: replyB.message.id });
+    const delReply = await alice.waitFor('message', (e) => e.message.text === 'what did it say?');
+    ok(
+      'reply to a deleted message snapshots it as deleted',
+      !!delReply.message.replyTo && delReply.message.replyTo.deleted === true && delReply.message.replyTo.text === '',
+      JSON.stringify(delReply.message.replyTo)
+    );
+
+    const beforeDeadReact = bob.events.length;
+    bob.send({ type: 'react', convoId: dmAB, id: replyB.message.id, emoji: '❤️', add: true });
+    await sleep(300);
+    ok(
+      'reactions on deleted messages rejected',
+      !bob.events.slice(beforeDeadReact).some((e) => e.type === 'reaction' && e.id === replyB.message.id)
+    );
 
     console.log('\n— user accounts —');
     // Use a third client for auth tests
