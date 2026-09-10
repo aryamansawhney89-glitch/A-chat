@@ -42,6 +42,7 @@ const state = {
   ws: null,
   connected: false,
   recording: false,
+  incoming: null,       // pending incoming voice call invite
   authenticated: false,
   authToken: null,
   authUsername: null,
@@ -136,6 +137,7 @@ let actx = null;
 function pop(freq) {
   try {
     actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume().catch(() => {});
     const o = actx.createOscillator();
     const g = actx.createGain();
     o.type = 'sine';
@@ -211,6 +213,8 @@ function connect() {
   state.ws.onclose = () => {
     state.connected = false;
     setConnUI();
+    // a dead socket kills any in-flight call signalling
+    if (activeCall.id || state.incoming) teardownCall();
     setTimeout(connect, 1600); // auto-reconnect
   };
   state.ws.onerror = () => state.ws.close();
@@ -370,6 +374,7 @@ function handle(msg) {
       renderMe();
       renderChatList();
       updateActiveHeader();
+      updateCallBtn(); // bot DMs have no 📞
       break;
     }
 
@@ -457,6 +462,107 @@ function handle(msg) {
       break;
     }
 
+    /* ---- voice call signalling ---- */
+
+    case 'call_created': {
+      // server accepted our invite and is ringing the other side
+      if (!activeCall.convoId) break;
+      activeCall.id = msg.callId;
+      activeCall.status = 'calling';
+      setCallStatus('Ringing…');
+      break;
+    }
+
+    case 'call_invite': {
+      if (activeCall.id || activeCall.status !== 'idle' || state.incoming) {
+        wsSend({ type: 'call_reject', callId: msg.callId }); // busy
+        break;
+      }
+      if (msg.from === state.me) break;
+      state.incoming = { callId: msg.callId, convoId: msg.convoId, from: msg.from, callees: msg.callees || [] };
+      showIncoming(state.incoming);
+      startRing();
+      break;
+    }
+
+    case 'call_join': {
+      if (!activeCall.id || activeCall.id !== msg.callId) break;
+      if (msg.isYou) {
+        // we just got in; everyone already there sends us an offer
+        activeCall.status = 'connected';
+        if (!activeCall.startedAt) { activeCall.startedAt = Date.now(); startCallTimer(); }
+        setCallStatus('Connected');
+        for (const n of (msg.peers || [])) if (n !== state.me) ensurePeer(n);
+      } else {
+        // a new participant joined — we joined first, so we send the offer
+        if (activeCall.status !== 'connected') {
+          activeCall.status = 'connected';
+          if (!activeCall.startedAt) { activeCall.startedAt = Date.now(); startCallTimer(); }
+          setCallStatus('Connected');
+        }
+        if (msg.offerTo && msg.offerTo !== state.me) offerToPeer(msg.offerTo);
+      }
+      renderCallPeers();
+      break;
+    }
+
+    case 'call_signal': {
+      onCallSignal(msg);
+      break;
+    }
+
+    case 'call_peer_left': {
+      if (!activeCall.id || activeCall.id !== msg.callId) break;
+      onCallPeerLeft(msg.name);
+      break;
+    }
+
+    case 'call_declined': {
+      if (activeCall.convoId || state.incoming) toast(`${msg.from} declined the call`);
+      break;
+    }
+
+    case 'call_cancelled': {
+      if (state.incoming && state.incoming.callId === msg.callId) {
+        state.incoming = null;
+        hideIncoming();
+        stopRing();
+      }
+      break;
+    }
+
+    case 'call_failed': {
+      const meta = activeCall.convoId ? metaFor(activeCall.convoId) : null;
+      const who = meta ? meta.title : 'They';
+      const why = msg.reason === 'offline' ? `${who} is offline`
+        : msg.reason === 'busy' ? `${who} is on another call`
+        : msg.reason === 'nobody' ? 'Nobody in this chat can take a call'
+        : 'Call failed';
+      teardownCall();
+      toast(why);
+      break;
+    }
+
+    case 'call_error': {
+      teardownCall();
+      toast(msg.error || 'Call failed');
+      break;
+    }
+
+    case 'call_ended': {
+      const mine = activeCall.id === msg.callId;
+      const ringing = state.incoming && state.incoming.callId === msg.callId;
+      if (!mine && !ringing) break;
+      const duration = Number(msg.duration) || 0;
+      teardownCall();
+      const label = msg.reason === 'timeout' ? 'No answer'
+        : msg.reason === 'declined' ? 'Call declined'
+        : msg.reason === 'cancelled' ? 'Call cancelled'
+        : 'Call ended';
+      toast(duration > 0 ? `${label} · ${fmtDur(duration)}` : label);
+      break;
+    }
+
     case 'error': {
       toast(msg.error || 'Something went wrong');
       groupCreateBtn.disabled = false;
@@ -514,7 +620,26 @@ function listEntries() {
 function previewText(m) {
   if (m.kind === 'photo') return '📸 Photo' + (m.text ? `: ${m.text}` : '');
   if (m.kind === 'voice') return '🎙️ Voice message';
+  if (m.kind === 'call') return callPreview(m);
   return m.text;
+}
+
+// "📞 Voice call · 1:23" / "❌ Missed voice call" — also used by the bubble.
+function callParts(m) {
+  const media = m.media || {};
+  const status = media.status || 'completed';
+  const missed = status !== 'completed';
+  const dur = Number(media.duration) || 0;
+  const icon = status === 'declined' ? '📵' : missed ? '❌' : '📞';
+  const label = status === 'declined' ? 'Declined voice call'
+    : status === 'cancelled' ? 'Cancelled voice call'
+    : missed ? 'Missed voice call' : 'Voice call';
+  return { icon, label, dur, missed };
+}
+
+function callPreview(m) {
+  const p = callParts(m);
+  return `${p.icon} ${p.label}` + (p.dur > 0 ? ` · ${fmtDur(p.dur)}` : '');
 }
 
 function renderChatList() {
@@ -623,6 +748,7 @@ function openChat(convoId) {
   chatTitle.textContent = meta.title;
   applyAvatar(chatAvatar, meta.group ? meta.group.id : meta.title, meta.pic, meta.kind === 'group' ? '👥' : meta.kind === 'room' ? '🔒' : undefined);
   updateActiveHeader();
+  updateCallBtn();
 
   const chat = getChat(convoId);
   chat.unread = 0;
@@ -806,6 +932,27 @@ function buildBubble(m, prev) {
     bubble.appendChild(buildVoicePlayer(m));
   }
 
+  if (m.kind === 'call') {
+    const parts = callParts(m);
+    bubble.classList.add('call-bubble');
+    const line = document.createElement('span');
+    line.className = 'call-line ' + (parts.missed ? 'missed' : 'ok');
+    const ico = document.createElement('span');
+    ico.className = 'call-ico';
+    ico.textContent = parts.icon;
+    const label = document.createElement('span');
+    label.className = 'call-label';
+    label.textContent = parts.label;
+    line.append(ico, label);
+    if (parts.dur > 0) {
+      const dur = document.createElement('span');
+      dur.className = 'call-dur';
+      dur.textContent = fmtDur(parts.dur);
+      line.appendChild(dur);
+    }
+    bubble.appendChild(line);
+  }
+
   const metaEl = document.createElement('span');
   metaEl.className = 'meta';
   metaEl.dataset.id = m.id;
@@ -857,18 +1004,20 @@ function buildBubble(m, prev) {
   row.appendChild(wrap);
   row.dataset.msgId = m.id;
 
-  // Long-press / right-click to open reaction picker
-  let pressTimer = null;
-  const openPicker = (e) => {
-    if (e) e.preventDefault();
-    openReactionPicker(m, reactionsEl);
-  };
-  row.addEventListener('contextmenu', (e) => { e.preventDefault(); openPicker(e); });
-  row.addEventListener('pointerdown', () => {
-    pressTimer = setTimeout(openPicker, 500);
-  });
-  row.addEventListener('pointerup', () => clearTimeout(pressTimer));
-  row.addEventListener('pointerleave', () => clearTimeout(pressTimer));
+  // Long-press / right-click to open reaction picker (not on call log entries)
+  if (m.kind !== 'call') {
+    let pressTimer = null;
+    const openPicker = (e) => {
+      if (e) e.preventDefault();
+      openReactionPicker(m, reactionsEl);
+    };
+    row.addEventListener('contextmenu', (e) => { e.preventDefault(); openPicker(e); });
+    row.addEventListener('pointerdown', () => {
+      pressTimer = setTimeout(openPicker, 500);
+    });
+    row.addEventListener('pointerup', () => clearTimeout(pressTimer));
+    row.addEventListener('pointerleave', () => clearTimeout(pressTimer));
+  }
 
   return row;
 }
@@ -1271,6 +1420,11 @@ function pickRecMime() {
   return '';
 }
 
+// MediaRecorder mime types can carry codec parameters ("audio/webm;codecs=opus",
+// "audio/mp4;codecs=mp4a.40.2"). FileReader copies them verbatim into the data
+// URL, so strip them — the server keys its whitelist off the bare type.
+const baseMime = (t) => String(t || '').split(';')[0].trim().toLowerCase();
+
 function mimeExt(mime) {
   if (!mime) return '.webm';
   if (mime.includes('mp4') || mime.includes('aac') || mime.includes('m4a')) return '.m4a';
@@ -1357,7 +1511,8 @@ async function computeWave(blob) {
 }
 
 async function onRecStop() {
-  const blob = new Blob(rec.chunks, { type: rec.mime || (rec.recorder && rec.recorder.mimeType) || 'audio/webm' });
+  const recMime = baseMime(rec.mime || (rec.recorder && rec.recorder.mimeType)) || 'audio/webm';
+  const blob = new Blob(rec.chunks, { type: recMime });
   rec.chunks = [];
   if (rec.cancelled) return;
   if (blob.size < 800) { toast('Recording too short'); return; }
@@ -1379,13 +1534,411 @@ async function onRecStop() {
       media: { url, duration: Math.round(duration * 10) / 10, wave },
     });
   } catch (err) {
-    toast(err.message || 'Upload failed');
+    toast(err.message || 'Voice message upload failed');
   }
 }
 
 micBtn.addEventListener('click', startRecording);
 recCancelBtn.addEventListener('click', () => stopRecording(false));
 recSendBtn.addEventListener('click', () => stopRecording(true));
+
+/* ------------------------------ voice calls --------------------------------
+   Peer-to-peer WebRTC audio. The server (server.js) only relays SDP/ICE
+   signalling between participants of the same conversation, so no media ever
+   touches it. Group calls use a small mesh (one RTCPeerConnection per peer);
+   whoever joined the call first creates the offer for whoever joined later. */
+
+const callBtn = $('callBtn');
+const incomingCallModal = $('incomingCallModal');
+const incomingAvatarEl = $('incomingAvatar');
+const incomingNameEl = $('incomingName');
+const incomingStateEl = $('incomingState');
+const acceptCallBtn = $('acceptCallBtn');
+const declineCallBtn = $('declineCallBtn');
+const callOverlay = $('callOverlay');
+const callKindEl = $('callKind');
+const callAvatarEl = $('callAvatar');
+const callNameEl = $('callName');
+const callStateEl = $('callState');
+const callTimerEl = $('callTimer');
+const callPeersEl = $('callPeers');
+const muteBtn = $('muteBtn');
+const endCallBtn = $('endCallBtn');
+const speakerBtn = $('speakerBtn');
+
+// STUN only — media flows straight between browsers. Peers behind symmetric
+// NATs (no TURN server here) may fail to connect; the UI says so.
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+];
+
+const activeCall = {
+  id: null,
+  convoId: null,
+  direction: null,     // 'in' | 'out'
+  status: 'idle',      // 'idle' | 'dialling' | 'calling' | 'connecting' | 'connected'
+  startedAt: 0,
+  timer: null,
+  peers: new Map(),    // name -> {pc, audio, pending[]}
+  localStream: null,
+  muted: false,
+  speaker: false,
+  sinkId: null,
+};
+
+async function getMicStream() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error('Voice calls need a browser with microphone support');
+  }
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+}
+
+function callIdentity(convoId) {
+  const meta = metaFor(convoId);
+  if (!meta) return { title: 'Voice call', pic: null, key: 'call', group: false };
+  return { title: meta.title, pic: meta.pic, key: meta.group ? meta.group.id : meta.title, group: meta.kind !== 'dm' };
+}
+
+/* ---- peer connections ---- */
+
+function ensurePeer(name) {
+  if (activeCall.peers.has(name)) return activeCall.peers.get(name);
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const peer = { pc, audio: null, pending: [] };
+  activeCall.peers.set(name, peer);
+
+  if (activeCall.localStream) {
+    for (const t of activeCall.localStream.getAudioTracks()) pc.addTrack(t, activeCall.localStream);
+  }
+  pc.onicecandidate = (e) => {
+    if (!e.candidate || !activeCall.id) return;
+    wsSend({
+      type: 'call_signal',
+      callId: activeCall.id,
+      to: name,
+      candidate: {
+        candidate: e.candidate.candidate,
+        sdpMid: e.candidate.sdpMid,
+        sdpMLineIndex: e.candidate.sdpMLineIndex,
+      },
+    });
+  };
+  pc.ontrack = (e) => attachRemoteAudio(name, e.streams[0] || new MediaStream([e.track]));
+  pc.onconnectionstatechange = () => {
+    if (!activeCall.id) return;
+    if (pc.connectionState === 'failed') setCallStatus('Connection lost — reconnecting…', true);
+    else if (pc.connectionState === 'connected' && activeCall.status === 'connected') setCallStatus('Connected');
+  };
+  renderCallPeers();
+  return peer;
+}
+
+function attachRemoteAudio(name, stream) {
+  const peer = activeCall.peers.get(name);
+  if (!peer) return;
+  if (!peer.audio) {
+    const el = document.createElement('audio');
+    el.className = 'remote-audio';
+    el.autoplay = true;
+    el.playsInline = true;
+    document.body.appendChild(el);
+    peer.audio = el;
+  }
+  peer.audio.srcObject = stream;
+  peer.audio.volume = activeCall.speaker ? 1 : 0.9;
+  applySpeakerSink();
+  const p = peer.audio.play();
+  if (p && p.catch) p.catch(() => { /* autoplay blocked — user can tap the bubble */ });
+}
+
+async function offerToPeer(name) {
+  const peer = ensurePeer(name);
+  try {
+    const offer = await peer.pc.createOffer({ offerToReceiveAudio: true });
+    await peer.pc.setLocalDescription(offer);
+    wsSend({ type: 'call_signal', callId: activeCall.id, to: name, sdp: peer.pc.localDescription });
+  } catch (err) {
+    console.error('createOffer failed', err);
+  }
+}
+
+async function onCallSignal(msg) {
+  if (!activeCall.id || activeCall.id !== msg.callId) return;
+  const peer = ensurePeer(msg.from);
+  try {
+    if (msg.sdp) {
+      await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      for (const c of peer.pending.splice(0)) {
+        try { await peer.pc.addIceCandidate(c); } catch { /* stale candidate */ }
+      }
+      if (msg.sdp.type === 'offer') {
+        const answer = await peer.pc.createAnswer();
+        await peer.pc.setLocalDescription(answer);
+        wsSend({ type: 'call_signal', callId: activeCall.id, to: msg.from, sdp: peer.pc.localDescription });
+      }
+    } else if (msg.candidate) {
+      const c = new RTCIceCandidate(msg.candidate);
+      if (peer.pc.remoteDescription) await peer.pc.addIceCandidate(c).catch(() => {});
+      else peer.pending.push(c); // SDP has not arrived yet — queue it
+    }
+  } catch (err) {
+    console.error('call signal failed', err);
+  }
+}
+
+function dropPeer(name) {
+  const peer = activeCall.peers.get(name);
+  if (!peer) return;
+  try { peer.pc.close(); } catch { /* already closed */ }
+  if (peer.audio) {
+    peer.audio.srcObject = null;
+    peer.audio.remove();
+  }
+  activeCall.peers.delete(name);
+  renderCallPeers();
+}
+
+/* ---- overlay + timer ---- */
+
+function showCallOverlay() {
+  const id = callIdentity(activeCall.convoId);
+  callKindEl.textContent = activeCall.direction === 'out' ? 'Outgoing voice call' : 'Voice call';
+  applyAvatar(callAvatarEl, id.key, id.pic, id.group ? '👥' : undefined);
+  callNameEl.textContent = id.title;
+  callTimerEl.textContent = '0:00';
+  callTimerEl.classList.add('hidden');
+  callOverlay.classList.remove('hidden');
+  updateMuteBtn();
+  updateSpeakerBtn();
+  renderCallPeers();
+}
+
+function setCallStatus(text, isError) {
+  callStateEl.textContent = text;
+  callStateEl.classList.toggle('connected', text === 'Connected');
+  callStateEl.classList.toggle('error', !!isError);
+}
+
+function startCallTimer() {
+  clearInterval(activeCall.timer);
+  callTimerEl.classList.remove('hidden');
+  const tick = () => { callTimerEl.textContent = fmtDur((Date.now() - activeCall.startedAt) / 1000); };
+  tick();
+  activeCall.timer = setInterval(tick, 500);
+}
+
+function renderCallPeers() {
+  callPeersEl.innerHTML = '';
+  if (activeCall.peers.size < 2) return; // a 1:1 call needs no participant chips
+  const add = (name, isYou) => {
+    const chip = document.createElement('span');
+    chip.className = 'call-peer-chip' + (isYou ? ' you' : '');
+    chip.textContent = isYou ? `${name} (you)` : name;
+    callPeersEl.appendChild(chip);
+  };
+  add(state.me, true);
+  for (const n of activeCall.peers.keys()) add(n, false);
+}
+
+function updateMuteBtn() {
+  muteBtn.classList.toggle('off', activeCall.muted);
+  muteBtn.title = activeCall.muted ? 'Unmute' : 'Mute';
+}
+
+function updateSpeakerBtn() {
+  speakerBtn.classList.toggle('off', activeCall.speaker);
+  speakerBtn.title = activeCall.speaker ? 'Speaker on' : 'Speaker off';
+}
+
+function applySpeakerSink() {
+  if (!activeCall.speaker || !activeCall.sinkId) return;
+  if (typeof HTMLMediaElement.prototype.setSinkId !== 'function') return;
+  for (const peer of activeCall.peers.values()) {
+    if (peer.audio) peer.audio.setSinkId(activeCall.sinkId).catch(() => {});
+  }
+}
+
+/* ---- ringing tone (Web Audio, no files) ---- */
+
+let ringTimer = null;
+function startRing() {
+  stopRing();
+  const beat = () => { pop(660); setTimeout(() => pop(880), 190); };
+  beat();
+  ringTimer = setInterval(beat, 1900);
+}
+function stopRing() {
+  clearInterval(ringTimer);
+  ringTimer = null;
+}
+
+/* ---- incoming call ---- */
+
+function showIncoming(inv) {
+  const u = findUser(inv.from);
+  applyAvatar(incomingAvatarEl, inv.from, u ? u.pic : null);
+  incomingNameEl.textContent = inv.from;
+  const others = (inv.callees || []).filter((n) => n !== state.me);
+  incomingStateEl.textContent = others.length ? `Ringing… (+${others.length} more)` : 'Ringing…';
+  incomingCallModal.classList.remove('hidden');
+}
+
+function hideIncoming() {
+  incomingCallModal.classList.add('hidden');
+}
+
+async function acceptIncoming() {
+  const inv = state.incoming;
+  if (!inv) return;
+  state.incoming = null;
+  let stream;
+  try {
+    stream = await getMicStream();
+  } catch (err) {
+    wsSend({ type: 'call_reject', callId: inv.callId });
+    hideIncoming();
+    stopRing();
+    toast(err.message || 'Microphone permission denied');
+    return;
+  }
+  hideIncoming();
+  stopRing();
+  activeCall.id = inv.callId;
+  activeCall.convoId = inv.convoId;
+  activeCall.direction = 'in';
+  activeCall.status = 'connecting';
+  activeCall.localStream = stream;
+  showCallOverlay();
+  setCallStatus('Connecting…');
+  wsSend({ type: 'call_accept', callId: inv.callId });
+}
+
+function declineIncoming() {
+  const inv = state.incoming;
+  state.incoming = null;
+  if (inv) wsSend({ type: 'call_reject', callId: inv.callId });
+  hideIncoming();
+  stopRing();
+}
+
+/* ---- placing / ending ---- */
+
+async function startCall() {
+  if (!state.active) return;
+  if (activeCall.id || activeCall.status !== 'idle') { toast('You are already on a call'); return; }
+  if (state.recording) stopRecording(false);
+  const convoId = state.active;
+  let stream;
+  try {
+    stream = await getMicStream();
+  } catch (err) {
+    toast(err.message || 'Microphone permission denied');
+    return;
+  }
+  activeCall.localStream = stream;
+  activeCall.convoId = convoId;
+  activeCall.direction = 'out';
+  activeCall.status = 'dialling';
+  showCallOverlay();
+  setCallStatus('Calling…');
+  wsSend({ type: 'call_invite', convoId });
+}
+
+// Local hang-up: tell the server, then tear everything down.
+function hangUp() {
+  if (activeCall.id) wsSend({ type: 'call_leave', callId: activeCall.id });
+  teardownCall();
+}
+
+function teardownCall() {
+  for (const name of [...activeCall.peers.keys()]) dropPeer(name);
+  activeCall.peers.clear();
+  if (activeCall.localStream) {
+    activeCall.localStream.getTracks().forEach((t) => t.stop());
+    activeCall.localStream = null;
+  }
+  clearInterval(activeCall.timer);
+  activeCall.timer = null;
+  activeCall.id = null;
+  activeCall.convoId = null;
+  activeCall.direction = null;
+  activeCall.status = 'idle';
+  activeCall.startedAt = 0;
+  activeCall.muted = false;
+  activeCall.speaker = false;
+  activeCall.sinkId = null;
+  callOverlay.classList.add('hidden');
+  callPeersEl.innerHTML = '';
+  hideIncoming();
+  stopRing();
+  state.incoming = null;
+}
+
+function onCallPeerLeft(name) {
+  dropPeer(name);
+  toast(`${name} left the call`);
+}
+
+async function toggleMute() {
+  if (!activeCall.localStream) return;
+  activeCall.muted = !activeCall.muted;
+  for (const t of activeCall.localStream.getAudioTracks()) t.enabled = !activeCall.muted;
+  updateMuteBtn();
+  setCallStatus(activeCall.muted ? 'Muted' : 'Connected');
+}
+
+async function toggleSpeaker() {
+  activeCall.speaker = !activeCall.speaker;
+  if (activeCall.speaker && !activeCall.sinkId && navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+    try {
+      const outs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audiooutput' && d.deviceId);
+      if (outs.length > 1) activeCall.sinkId = outs[outs.length - 1].deviceId;
+    } catch { /* device list unavailable */ }
+  }
+  for (const peer of activeCall.peers.values()) {
+    if (peer.audio) peer.audio.volume = activeCall.speaker ? 1 : 0.9;
+  }
+  applySpeakerSink();
+  updateSpeakerBtn();
+}
+
+// Hide the 📞 button where a call makes no sense (DMs with the demo bots).
+function updateCallBtn() {
+  const meta = state.active ? metaFor(state.active) : null;
+  let show = false;
+  let title = 'Voice call';
+  if (meta && meta.kind === 'dm') {
+    const other = meta.title;
+    show = !findUserBy(other, (u) => u.bot);
+  } else if (meta) {
+    const humans = meta.members.filter((n) => n !== state.me && !findUserBy(n, (u) => u.bot));
+    show = humans.length > 0;
+    title = 'Start group call';
+  }
+  callBtn.classList.toggle('hidden', !show);
+  callBtn.title = title;
+}
+
+function findUserBy(name, pred) {
+  const u = findUser(name);
+  return u ? pred(u) : false;
+}
+
+callBtn.addEventListener('click', startCall);
+acceptCallBtn.addEventListener('click', acceptIncoming);
+declineCallBtn.addEventListener('click', declineIncoming);
+endCallBtn.addEventListener('click', hangUp);
+muteBtn.addEventListener('click', toggleMute);
+speakerBtn.addEventListener('click', toggleSpeaker);
+
+// A closing tab must not leave the other side ringing forever.
+window.addEventListener('beforeunload', () => {
+  if (activeCall.id) wsSend({ type: 'call_leave', callId: activeCall.id });
+});
 
 /* ------------------------------ profile picture ---------------------------- */
 

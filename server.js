@@ -42,7 +42,7 @@ const BOTS = [
         'Hi {u}! Great to see you on A-Chat 💬',
       ] },
       { keys: ['help', 'feature', 'how'], replies: [
-        'Here is what A-Chat can do: realtime messaging, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, message reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press any message to react to it!',
+        'Here is what A-Chat can do: realtime messaging, voice calls 📞, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, message reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press any message to react to it!',
       ] },
       { keys: ['group', 'invite'], replies: [
         'Groups are here! 👥 Tap the 👥 button in the sidebar, pick a name, a picture (optional) and tick the members you want.',
@@ -528,6 +528,219 @@ function maybeBotReact(convoId, m) {
   }
 }
 
+/* ------------------------------ voice calls -------------------------------- */
+
+/* WebRTC calls are peer-to-peer; the server only relays signalling.
+ *
+ *   client                          server                         client
+ *     |--- call_invite {convoId} -->|                                 |
+ *     |<-- call_created {callId} ---|--- call_invite {callId} ------->|  (rings)
+ *     |                             |<-- call_accept {callId} --------|
+ *     |<-- call_join {offerTo:B} ---|--- call_join {isYou, peers} --->|
+ *     |<========= call_signal {sdp|candidate} relayed both ways =====>|
+ *     |--- call_leave {callId} ---->|--- call_ended + call log ------>|
+ *
+ * The participant who joined the call *first* always creates the SDP offer for
+ * a newer participant, so two peers never create offers at the same time.
+ */
+
+const calls = new Map();                 // callId -> call
+const CALL_RING_TIMEOUT_MS = Number(process.env.CALL_RING_TIMEOUT_MS || 45000);
+const CALL_MAX_MEMBERS = 8;              // mesh cap for group calls
+const newCallId = () => crypto.randomBytes(6).toString('hex');
+
+function callMembers(call) {
+  return new Set([...call.joined, ...call.ringing]);
+}
+
+function sendCall(name, payload) {
+  send(clients.get(name), payload);
+}
+
+function userInCall(name) {
+  for (const c of calls.values()) {
+    if (!c.ended && callMembers(c).has(name)) return true;
+  }
+  return false;
+}
+
+function callDuration(call) {
+  return call.startedAt ? Math.max(0, Math.round((Date.now() - call.startedAt) / 1000)) : 0;
+}
+
+// A call entry lands in the conversation history, exactly like a message, so
+// both sides see "📞 Voice call · 1:23" / "❌ Missed voice call" after a reload.
+function logCallMessage(call, status, duration) {
+  const m = {
+    id: nextId++, convoId: call.convoId, from: call.initiator, kind: 'call', text: '',
+    media: {
+      status,
+      duration: Math.min(86400, Math.max(0, duration)),
+      members: [...call.participants].sort(),
+    },
+    ts: Date.now(), deliveredBy: [], readBy: [], reactions: {},
+  };
+  for (const p of convoParticipants(call.convoId)) {
+    if (p === call.initiator) continue;
+    if (isBot(p)) { m.deliveredBy.push(p); m.readBy.push(p); }
+    else if (clients.has(p)) m.deliveredBy.push(p);
+  }
+  pushMessage(m);
+  for (const p of convoParticipants(call.convoId)) {
+    if (p !== call.initiator && !isBot(p)) send(clients.get(p), { type: 'message', message: m });
+  }
+  sendCall(call.initiator, { type: 'message', message: m }); // echo so the caller logs it too
+}
+
+function endCall(call, reason) {
+  if (call.ended) return;
+  call.ended = true;
+  clearTimeout(call.timer);
+  calls.delete(call.id);
+  const duration = callDuration(call);
+  for (const n of callMembers(call)) {
+    sendCall(n, { type: 'call_ended', callId: call.id, convoId: call.convoId, reason, duration });
+  }
+  const status = call.startedAt
+    ? 'completed'
+    : (reason === 'declined' ? 'declined' : reason === 'cancelled' ? 'cancelled' : 'missed');
+  logCallMessage(call, status, duration);
+}
+
+function onRingTimeout(call) {
+  if (call.ended) return;
+  const unanswered = [...call.ringing];
+  call.ringing.clear();
+  for (const n of unanswered) sendCall(n, { type: 'call_cancelled', callId: call.id, reason: 'timeout' });
+  if (call.startedAt === null) endCall(call, 'timeout');
+  // else: someone already answered, the call carries on with them
+}
+
+// One participant hangs up (or disconnects). Ends the call when nobody is left
+// talking, or when the caller gives up before anyone has answered.
+function leaveCall(call, name) {
+  if (call.ended) return;
+  call.ringing.delete(name);
+  const idx = call.joined.indexOf(name);
+  if (idx >= 0) call.joined.splice(idx, 1);
+  for (const n of callMembers(call)) {
+    sendCall(n, { type: 'call_peer_left', callId: call.id, name });
+  }
+  if (call.startedAt === null && name === call.initiator) {
+    endCall(call, 'cancelled');       // caller hung up while it was still ringing
+  } else if (call.startedAt !== null && call.joined.length < 2) {
+    endCall(call, 'ended');           // last talker left — call is over
+  } else if (call.startedAt === null && call.ringing.size === 0 && call.declined.size) {
+    endCall(call, 'declined');        // everyone invited declined
+  } else if (call.startedAt === null && call.joined.length === 0) {
+    endCall(call, 'cancelled');       // nobody left at all
+  }
+}
+
+function dropUserFromCalls(name) {
+  for (const call of [...calls.values()]) {
+    if (callMembers(call).has(name)) leaveCall(call, name);
+  }
+}
+
+function startCall(ws, msg) {
+  const from = ws.userName;
+  if (!from) return;
+  const convoId = String(msg.convoId || '');
+  if (!canAccess(convoId, from)) return;
+  if (userInCall(from)) {
+    send(ws, { type: 'call_error', convoId, error: 'You are already on a call.' });
+    return;
+  }
+  const wanted = typeof msg.to === 'string' && msg.to ? msg.to : null;
+  const targets = convoParticipants(convoId)
+    .filter((n) => n !== from && !isBot(n) && (!wanted || n === wanted));
+  if (!targets.length) {
+    send(ws, { type: 'call_failed', convoId, reason: 'nobody' });
+    return;
+  }
+  const online = targets.filter((n) => clients.has(n));
+  if (!online.length) {
+    send(ws, { type: 'call_failed', convoId, reason: 'offline' });
+    return;
+  }
+  const free = online.filter((n) => !userInCall(n)).slice(0, CALL_MAX_MEMBERS);
+  if (!free.length) {
+    send(ws, { type: 'call_failed', convoId, reason: 'busy' });
+    return;
+  }
+  const call = {
+    id: newCallId(),
+    convoId,
+    initiator: from,
+    ringing: new Set(free),
+    joined: [from],
+    participants: new Set([from]), // everyone who ever picked up (for the call log)
+    declined: new Set(),
+    createdAt: Date.now(),
+    startedAt: null,
+    ended: false,
+    timer: null,
+  };
+  calls.set(call.id, call);
+  call.timer = setTimeout(() => onRingTimeout(call), CALL_RING_TIMEOUT_MS);
+  send(ws, { type: 'call_created', callId: call.id, convoId, callees: free });
+  for (const n of free) {
+    sendCall(n, { type: 'call_invite', callId: call.id, convoId, from, callees: free });
+  }
+}
+
+function acceptCall(call, name) {
+  call.ringing.delete(name);
+  const existing = [...call.joined];
+  call.joined.push(name);
+  call.participants.add(name);
+  if (call.startedAt === null) call.startedAt = Date.now();
+  // The newcomer only answers offers; everyone already in the call offers to them.
+  sendCall(name, {
+    type: 'call_join', callId: call.id, convoId: call.convoId, name, initiator: call.initiator,
+    isYou: true, peers: existing, members: [...call.joined],
+  });
+  for (const n of existing) {
+    sendCall(n, {
+      type: 'call_join', callId: call.id, convoId: call.convoId, name, initiator: call.initiator,
+      isYou: false, offerTo: name, members: [...call.joined],
+    });
+  }
+}
+
+function rejectCall(call, name) {
+  if (!call.ringing.has(name)) return;
+  call.ringing.delete(name);
+  call.declined.add(name);
+  for (const n of callMembers(call)) {
+    if (n !== name) sendCall(n, { type: 'call_declined', callId: call.id, from: name });
+  }
+  if (call.startedAt === null && call.ringing.size === 0) {
+    endCall(call, call.declined.size ? 'declined' : 'missed');
+  }
+}
+
+// Relay one SDP blob or one ICE candidate between two participants.
+function relayCallSignal(call, from, msg) {
+  const to = typeof msg.to === 'string' ? msg.to : '';
+  const members = callMembers(call);
+  if (!members.has(from) || !members.has(to)) return;
+  const out = { type: 'call_signal', callId: call.id, from };
+  if (msg.sdp && typeof msg.sdp === 'object') {
+    out.sdp = { type: String(msg.sdp.type || '').slice(0, 24), sdp: String(msg.sdp.sdp || '').slice(0, 40000) };
+  } else if (msg.candidate && typeof msg.candidate === 'object') {
+    out.candidate = {
+      candidate: String(msg.candidate.candidate || '').slice(0, 2000),
+      sdpMid: msg.candidate.sdpMid === null ? null : String(msg.candidate.sdpMid || '').slice(0, 16),
+      sdpMLineIndex: Number.isFinite(msg.candidate.sdpMLineIndex) ? msg.candidate.sdpMLineIndex : 0,
+    };
+  } else {
+    return;
+  }
+  sendCall(to, out);
+}
+
 /* ------------------------------ message router ---------------------------- */
 
 function handle(ws, msg) {
@@ -723,6 +936,40 @@ function handle(ws, msg) {
       break;
     }
 
+    case 'call_invite': startCall(ws, msg); break;
+
+    case 'call_accept': {
+      const me = ws.userName;
+      const call = calls.get(String(msg.callId || ''));
+      if (!me || !call || call.ended || !call.ringing.has(me)) return;
+      acceptCall(call, me);
+      break;
+    }
+
+    case 'call_reject': {
+      const me = ws.userName;
+      const call = calls.get(String(msg.callId || ''));
+      if (!me || !call || call.ended) return;
+      rejectCall(call, me);
+      break;
+    }
+
+    case 'call_signal': {
+      const me = ws.userName;
+      const call = calls.get(String(msg.callId || ''));
+      if (!me || !call || call.ended) return;
+      relayCallSignal(call, me, msg);
+      break;
+    }
+
+    case 'call_leave': {
+      const me = ws.userName;
+      const call = calls.get(String(msg.callId || ''));
+      if (!me || !call || call.ended || !callMembers(call).has(me)) return;
+      leaveCall(call, me);
+      break;
+    }
+
     case 'register': {
       const username = String(msg.username || '').trim().replace(/\s+/g, ' ').slice(0, 24);
       const password = String(msg.password || '');
@@ -880,7 +1127,14 @@ function handle(ws, msg) {
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '1d' }));
+app.use('/uploads', express.static(UPLOADS_DIR, {
+  maxAge: '1d',
+  setHeaders(res, filePath) {
+    const ct = SERVED_TYPES[path.extname(filePath).toLowerCase()];
+    if (ct) res.setHeader('Content-Type', ct);
+    res.setHeader('Accept-Ranges', 'bytes'); // lets players seek inside voice notes
+  },
+}));
 app.get('/healthz', (_req, res) => res.json({ ok: true, users: clients.size }));
 
 const UPLOAD_TYPES = {
@@ -890,30 +1144,69 @@ const UPLOAD_TYPES = {
   'image/gif': '.gif',
   'audio/webm': '.webm',
   'audio/ogg': '.ogg',
+  'audio/opus': '.ogg',
   'audio/mpeg': '.mp3',
+  'audio/mp3': '.mp3',
   'audio/mp4': '.m4a',
   'audio/aac': '.aac',
   'audio/wav': '.wav',
   'audio/x-wav': '.wav',
+  'audio/wave': '.wav',
+  'audio/x-m4a': '.m4a',
+};
+
+// Extension -> Content-Type for files we serve out of /uploads. `send` would
+// otherwise label .webm/.ogg as video/*, which some browsers refuse to decode
+// inside an <audio> element (voice notes).
+const SERVED_TYPES = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.webm': 'audio/webm',
+  '.ogg': 'audio/ogg',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.wav': 'audio/wav',
 };
 
 const uploadJson = express.json({ limit: '14mb' }); // 8MB binary ≈ 10.7MB base64
+
+// A data URL is  data:<type>[;<parameter>=<value>]*;base64,<payload>
+// MediaRecorder blobs keep their codec parameters ("audio/webm;codecs=opus",
+// "audio/mp4;codecs=mp4a.40.2"), and FileReader copies those verbatim into the
+// data URL — so the parameter list has to be tolerated, not rejected.
+const BASE64_RE = /^[A-Za-z0-9+/=\r\n]*$/;
+
+function parseDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) return null;
+  const marker = dataUrl.indexOf(';base64,');
+  if (marker < 5) return null;
+  const header = dataUrl.slice(5, marker).trim();
+  const payload = dataUrl.slice(marker + 8);
+  const mime = header.split(';')[0].trim().toLowerCase();
+  if (!/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(mime)) return null;
+  if (!BASE64_RE.test(payload)) return null;
+  return { mime, payload };
+}
 
 app.post('/api/upload', uploadJson, (req, res) => {
   const { dataUrl, name } = req.body || {};
   if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
     return res.status(400).json({ ok: false, error: 'dataUrl (base64 data URL) is required.' });
   }
-  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl);
-  if (!match) {
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) {
     return res.status(400).json({ ok: false, error: 'Only base64 data URLs are accepted.' });
   }
-  const mime = match[1].toLowerCase();
+  const mime = parsed.mime;
   const ext = UPLOAD_TYPES[mime];
   if (!ext) {
     return res.status(415).json({ ok: false, error: `Unsupported media type: ${mime}` });
   }
-  const buf = Buffer.from(match[2], 'base64');
+  const buf = Buffer.from(parsed.payload, 'base64');
   if (!buf.length) {
     return res.status(400).json({ ok: false, error: 'Empty upload.' });
   }
@@ -961,6 +1254,7 @@ wss.on('connection', (ws) => {
     }
   });
   ws.on('close', () => {
+    if (ws.userName) dropUserFromCalls(ws.userName);
     if (ws.userName && clients.get(ws.userName) === ws) {
       clients.delete(ws.userName);
       lastSeen.set(ws.userName, Date.now());

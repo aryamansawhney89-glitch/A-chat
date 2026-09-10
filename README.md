@@ -18,7 +18,13 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
   and served at `/uploads` (click to open the full-size lightbox)
 - **Voice messages 🎙️** — MediaRecorder capture with a live recording timer bar and
   cancel/send controls; each note gets a waveform (40 RMS bars) rendered into a custom
-  play/pause bubble player
+  play/pause bubble. Codec parameters from the recorder (`audio/webm;codecs=opus`,
+  Safari's `audio/mp4;codecs=mp4a.40.2`) are handled end to end
+- **Voice calls 📞** — tap 📞 in a chat header for peer-to-peer WebRTC audio: incoming-call
+  screen with answer/decline, ringing tone, call timer, mute & speaker controls,
+  busy/offline handling and a "no answer" timeout. Group chats get mesh calls (up to 8
+  people). Every call leaves a log entry in the chat — 📞 Voice call · 0:42, ❌ missed,
+  📵 declined — and shows up in the sidebar preview too player
 - **Profile pictures 👤** — click your own avatar to upload (client-resized to 256px),
   persisted per user in `data/users.json` and broadcast to everyone; the three bots
   ship with SVG avatars
@@ -36,7 +42,8 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
   `data/groups.json`, `data/rooms.json`, `data/accounts.json` and `data/users.json`
   (survive server restarts; legacy message stores are migrated automatically)
 - **Upload API** — `POST /api/upload` accepts base64 data URLs (images + audio,
-  8 MB cap) and returns a `/uploads/...` URL
+  8 MB cap, MIME parameters such as `codecs=opus` tolerated) and returns a
+  `/uploads/...` URL served with the correct `Content-Type` and byte-range support
 
 ## Run it locally
 
@@ -50,7 +57,9 @@ npm start        # serves on http://localhost:3000
 Open the page, pick a name, and start chatting. Open a **second browser tab with a
 different name** to chat live between two users — messages, typing indicators and
 read receipts all update in real time. Try creating a group with the 👥 button,
-sending a photo with 📎, or holding a conversation via 🎤 voice notes.
+sending a photo with 📎, recording a 🎤 voice note, or placing a 📞 voice call.
+(Allow microphone access; calls are peer-to-peer over WebRTC with STUN, so they work
+on the same machine/network and across typical NATs.)
 
 ### Smoke test
 
@@ -78,13 +87,16 @@ Start `npm start`, Plan **Free** → **Deploy**.
 
 ## How it works
 
-- `server.js` — Express static host + `ws` WebSocket router + `/api/upload`. Every
-  message carries a `convoId`: `dm::A::B` (two participants), `grp::<id>` (group), or
-  `room::<id>` (password-protected room). Presence, typing and per-member delivered/read
-  receipts (`deliveredBy` / `readBy` arrays) travel as JSON frames; history, groups,
-  profiles, reactions, accounts and rooms are kept in memory and flushed to JSON files
-  in `data/`. Passwords are hashed with PBKDF2 (10,000 iterations, SHA-512). Uploaded
-  media is written to `data/uploads` and served at `/uploads`.
+- `server.js` — Express static host + `ws` WebSocket router + `/api/upload` + WebRTC
+  call signalling relay. Every message carries a `convoId`: `dm::A::B` (two
+  participants), `grp::<id>` (group), or `room::<id>` (password-protected room).
+  Presence, typing and per-member delivered/read receipts (`deliveredBy` / `readBy`
+  arrays) travel as JSON frames; history, groups, profiles, reactions, accounts and
+  rooms are kept in memory and flushed to JSON files in `data/`. Passwords are hashed
+  with PBKDF2 (10,000 iterations, SHA-512). Uploaded media is written to `data/uploads`
+  and served at `/uploads`. Calls never touch media on the server — only SDP/ICE
+  signalling is relayed between participants, and each call is logged as a `kind:"call"`
+  message so both sides keep a history entry.
 - `public/` — zero-build frontend (`index.html`, `style.css`, `app.js`) plus
   `public/avatars/*.svg` for the bot profile pictures.
 - The client talks to the server over the same host/port (`ws://`/`wss://`), so it
@@ -94,7 +106,8 @@ Start `npm start`, Plan **Free** → **Deploy**.
 
 ## Configuration
 
-| Env var    | Default       | Description                        |
-|------------|---------------|------------------------------------|
-| `PORT`     | `3000`        | HTTP/WS port                       |
-| `DATA_DIR` | `./data`      | Where messages/groups/users/uploads live |
+| Env var              | Default | Description                        |
+|----------------------|---------|------------------------------------|
+| `PORT`               | `3000`  | HTTP/WS port                       |
+| `DATA_DIR`           | `./data`| Where messages/groups/users/uploads live |
+| `CALL_RING_TIMEOUT_MS` | `45000` | How long an unanswered call rings before it is logged as missed |
