@@ -1294,3 +1294,159 @@ html[data-theme="dark"] .call-line.ok .call-ico { color: var(--accent); }
   .reaction-picker { max-width: 90vw; flex-wrap: wrap; justify-content: center; }
   .reaction-pick { font-size: 20px; padding: 3px 4px; }
 }
+
+/* ---------------- Message actions: replies, edits, deletes ---------------- */
+
+/* quoted original inside a reply bubble */
+.reply-quote {
+  display: block;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  background: rgba(0, 168, 132, 0.10);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.3;
+  white-space: normal;
+  user-select: none;
+}
+html[data-theme="dark"] .reply-quote { background: rgba(0, 168, 132, 0.18); }
+.bubble.photo-bubble .reply-quote { margin: 6px 6px 4px; }
+.reply-quote .rq-name { display: block; font-weight: 600; font-size: 12.5px; }
+.reply-quote .rq-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text-soft);
+}
+.reply-quote.deleted .rq-text { font-style: italic; }
+
+/* highlight when jumping from a quote to the original message */
+.msg-row.flash .bubble { animation: msgflash 1.15s ease; }
+@keyframes msgflash {
+  0%, 100% { filter: none; }
+  30% { filter: brightness(1.22) saturate(1.15); }
+}
+
+/* swipe-to-reply nudge */
+.msg-row .msg-wrap { transition: transform 0.3s ease; }
+.msg-row.swiped .msg-wrap { transform: translateX(46px); transition: transform 0.12s ease; }
+
+/* edited tag before the timestamp */
+.edited-tag { font-style: italic; }
+
+/* deleted-message tombstone */
+.bubble.deleted { font-style: italic; color: var(--text-soft); }
+.bubble.deleted .deleted-text { font-style: italic; color: var(--text-soft); }
+
+/* reply / edit bar above the composer */
+.reply-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 2px;
+  background: var(--panel-header);
+}
+.reply-bar .rb-accent {
+  width: 3px;
+  align-self: stretch;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.reply-bar .rb-body {
+  flex: 1;
+  min-width: 0;
+  background: var(--input-bg);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.reply-bar .rb-title { font-size: 12.5px; font-weight: 600; color: var(--accent-dark); }
+html[data-theme="dark"] .reply-bar .rb-title { color: var(--accent); }
+.reply-bar .rb-text {
+  font-size: 13px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* picker with a second row for message actions */
+.reaction-picker.has-actions { flex-direction: column; align-items: stretch; gap: 6px; }
+.picker-emoji-row { display: flex; align-items: center; gap: 4px; }
+.picker-actions {
+  display: flex;
+  gap: 2px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.picker-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.picker-action:hover { background: var(--hover); }
+.picker-action .pa-icon { font-size: 14px; }
+
+/* ---------------- Group / room info panel ---------------- */
+
+/* the header title + avatar become tappable for groups and rooms */
+.chat-header.infoable .chat-meta,
+.chat-header.infoable > .avatar { cursor: pointer; }
+
+.chat-info-body { display: flex; flex-direction: column; gap: 10px; }
+.ci-hero { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 0 2px; }
+.ci-avatar {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  font-size: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  background-size: cover;
+  background-position: center;
+}
+.ci-title { font-size: 18px; font-weight: 600; }
+.ci-sub { font-size: 12.5px; color: var(--text-soft); }
+.ci-created { text-align: center; font-size: 12.5px; color: var(--text-soft); }
+.ci-invite {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--input-bg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+}
+.ci-invite b { letter-spacing: 1px; }
+.ci-invite .btn { padding: 4px 10px; font-size: 12.5px; }
+
+.ci-members { display: flex; flex-direction: column; max-height: 260px; overflow-y: auto; }
+.ci-member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.ci-member:last-child { border-bottom: none; }
+.ci-member-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.ci-member-name { font-size: 14.5px; display: inline-flex; align-items: center; gap: 6px; }
+.ci-crown { font-size: 12px; }
+.ci-member-status { font-size: 12px; color: var(--text-soft); }
+.ci-member-status.online { color: var(--accent); }
+
+/* disabled rows in the add-to-call picker */
+.gm-member.disabled { opacity: 0.5; cursor: not-allowed; }
+.gm-member.disabled input { pointer-events: none; }

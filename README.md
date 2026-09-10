@@ -10,6 +10,11 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 - **WhatsApp Web UI** — chat list, message bubbles with tails, date separators, ✓ / ✓✓ / blue-tick receipts
 - **Password-protected rooms 🔒** — create a room with a name and password; join with the password or a 6-character invite code; share invite codes with others
 - **Message reactions 😍** — long-press (or right-click) any message to react with emoji; bots also react to your messages; click a reaction chip to toggle yours
+- **Message replies, edits & deletes ↩️✏️🗑️** — swipe a message (or use the long-press
+  menu) to reply with a quoted snapshot you can tap to jump back to the original; edit
+  your own texts and photo captions in place (tagged "edited"); delete your own
+  messages for everyone — the bubble becomes a "This message was deleted" tombstone
+  with text, media and reactions wiped, persisted across reloads
 - **Group chats 👥** — "New group" modal with name, optional group picture and member
   checkboxes; group messages show colored sender names; delivery/read ticks aggregate
   across all members
@@ -23,8 +28,15 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 - **Voice calls 📞** — tap 📞 in a chat header for peer-to-peer WebRTC audio: incoming-call
   screen with answer/decline, ringing tone, call timer, mute & speaker controls,
   busy/offline handling and a "no answer" timeout. Group chats get mesh calls (up to 8
-  people). Every call leaves a log entry in the chat — 📞 Voice call · 0:42, ❌ missed,
+  people): everyone online is rung, and anyone already on the call can pull in more
+  people afterwards with the 👤+ button (late joiners get the full peer mesh and their
+  own ring timeout — perfect for members who were offline when the call started).
+  Every call leaves a log entry in the chat — 📞 Voice call · 0:42, ❌ missed,
   📵 declined — and shows up in the sidebar preview too
+- **Group & room info 👥** — tap a group or room name/avatar in the chat header for an info
+  panel with the picture, member count, "Created by … on …" line and the full member list
+  (creator 👑 first, online status / last seen per member). Rooms also show their invite
+  code with a copy button
 - **Video calls 🎥** — tap 🎥 for a peer-to-peer WebRTC video call: live camera tiles
   for you (mirrored preview) and every peer, camera on/off toggle, plus the same
   mute/speaker controls, ringing screen, timer and busy/offline handling as voice

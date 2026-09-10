@@ -7,8 +7,13 @@
  *   aggregated receipts → photo upload + message (bot reacts) → voice upload
  *   + message (bot reacts) → profile picture broadcast → voice call signalling
  *   (invite/accept/SDP relay/hang-up/missed) → video call signalling (kind
- *   end-to-end, history callKind, voice default) → oversized upload rejected →
- *   JSON persistence (with legacy messages.json migration).
+ *   end-to-end, history callKind, voice default) → message replies (quote
+ *   snapshots, group replies, tombstones) → message edits (ownership, blank
+ *   rejection, history persistence) → message deletes (ownership, tombstone,
+ *   reactions wiped, edit/react-after-delete rejected) → group calls (multi-ring,
+ *   partial decline, member added mid-call via call_add, leave lifecycle, call
+ *   log) → oversized upload rejected → JSON persistence (with legacy
+ *   messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
  */
@@ -310,6 +315,111 @@ function makeWavDataUrl() {
     const newReactEvents = alice.events.slice(eventsBefore).filter((e) => e.type === 'reaction' && e.id === reactTarget.message.id);
     ok('invalid emoji rejected (no reaction broadcast)', newReactEvents.length === 0);
 
+    console.log('\n— message replies —');
+    // Bob asks, Alice quotes him in her reply
+    bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'what is the plan?' });
+    const origQ = await alice.waitFor('message', (e) => e.message.text === 'what is the plan?');
+    alice.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'dinner at 8!', replyTo: origQ.message.id });
+    const replyB = await bob.waitFor('message', (e) => e.message.text === 'dinner at 8!');
+    ok(
+      'reply carries a replyTo snapshot of the original',
+      !!replyB.message.replyTo && replyB.message.replyTo.id === origQ.message.id &&
+        replyB.message.replyTo.from === 'Bob' && replyB.message.replyTo.text === 'what is the plan?',
+      JSON.stringify(replyB.message.replyTo)
+    );
+
+    // a replyTo pointing at nothing is dropped, message still goes through
+    bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'no parent here', replyTo: 424242 });
+    const bogus = await bob.waitFor('message', (e) => e.message.text === 'no parent here');
+    ok('unknown replyTo id ignored (message still sent)', !bogus.message.replyTo);
+
+    // replies also work in groups
+    bob.send({ type: 'message', convoId: gid, kind: 'text', text: 'group question' });
+    const gQ = await alice.waitFor('message', (e) => e.message.convoId === gid && e.message.text === 'group question');
+    alice.send({ type: 'message', convoId: gid, kind: 'text', text: 'group answer', replyTo: gQ.message.id });
+    const gReply = await bob.waitFor('message', (e) => e.message.convoId === gid && e.message.text === 'group answer');
+    ok('replies work in group chats', !!gReply.message.replyTo && gReply.message.replyTo.id === gQ.message.id);
+
+    console.log('\n— message edits —');
+    const beforeForeignEdit = bob.events.length;
+    bob.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: 'Bob should not edit this' });
+    await sleep(300);
+    ok(
+      'cannot edit someone else\'s message',
+      !bob.events.slice(beforeForeignEdit).some((e) => e.type === 'message_edited')
+    );
+
+    alice.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: 'dinner at 9!' });
+    const editedB = await bob.waitFor('message_edited', (e) => e.id === replyB.message.id);
+    ok('edit broadcast reaches the other side', editedB.text === 'dinner at 9!' && editedB.editedAt > 0);
+
+    alice.send({ type: 'history', convoId: dmAB });
+    const histAfterEdit = await alice.waitFor(
+      'history',
+      (e) => e.convoId === dmAB && (e.messages || []).some((m) => m.id === replyB.message.id && m.editedAt)
+    );
+    const editedMsg = histAfterEdit.messages.find((m) => m.id === replyB.message.id);
+    ok('history persists edited text + editedAt', editedMsg.text === 'dinner at 9!' && Number.isFinite(editedMsg.editedAt));
+
+    const beforeBlankEdit = alice.events.length;
+    alice.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: '   ' });
+    await sleep(300);
+    ok(
+      'blank edit of a text message rejected',
+      !alice.events.slice(beforeBlankEdit).some((e) => e.type === 'message_edited')
+    );
+
+    console.log('\n— message deletes —');
+    const beforeForeignDel = alice.events.length;
+    bob.send({ type: 'delete', convoId: dmAB, id: replyB.message.id });
+    await sleep(300);
+    ok(
+      'cannot delete someone else\'s message',
+      !alice.events.slice(beforeForeignDel).some((e) => e.type === 'message_deleted')
+    );
+
+    // a reaction on the message must vanish when the message is deleted
+    bob.send({ type: 'react', convoId: dmAB, id: replyB.message.id, emoji: '👍', add: true });
+    await alice.waitFor('reaction', (e) => e.id === replyB.message.id && (e.reactions['👍'] || []).includes('Bob'));
+
+    alice.send({ type: 'delete', convoId: dmAB, id: replyB.message.id });
+    const delB = await bob.waitFor('message_deleted', (e) => e.id === replyB.message.id);
+    ok('delete broadcast reaches the other side', !!delB);
+
+    alice.send({ type: 'history', convoId: dmAB });
+    const histAfterDel = await alice.waitFor(
+      'history',
+      (e) => e.convoId === dmAB && (e.messages || []).some((m) => m.id === replyB.message.id && m.deleted)
+    );
+    const delMsg = histAfterDel.messages.find((m) => m.id === replyB.message.id);
+    ok('history keeps a tombstone (text + media cleared)', delMsg.deleted === true && delMsg.text === '' && delMsg.media === null);
+    ok('reactions cleared on delete', !delMsg.reactions || Object.keys(delMsg.reactions).length === 0);
+
+    const beforeRevive = alice.events.length;
+    alice.send({ type: 'edit', convoId: dmAB, id: replyB.message.id, text: 'back from the dead' });
+    await sleep(300);
+    ok(
+      'deleted message cannot be edited',
+      !alice.events.slice(beforeRevive).some((e) => e.type === 'message_edited')
+    );
+
+    // quoting a deleted message yields a tombstone snapshot
+    bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'what did it say?', replyTo: replyB.message.id });
+    const delReply = await alice.waitFor('message', (e) => e.message.text === 'what did it say?');
+    ok(
+      'reply to a deleted message snapshots it as deleted',
+      !!delReply.message.replyTo && delReply.message.replyTo.deleted === true && delReply.message.replyTo.text === '',
+      JSON.stringify(delReply.message.replyTo)
+    );
+
+    const beforeDeadReact = bob.events.length;
+    bob.send({ type: 'react', convoId: dmAB, id: replyB.message.id, emoji: '❤️', add: true });
+    await sleep(300);
+    ok(
+      'reactions on deleted messages rejected',
+      !bob.events.slice(beforeDeadReact).some((e) => e.type === 'reaction' && e.id === replyB.message.id)
+    );
+
     console.log('\n— user accounts —');
     // Use a third client for auth tests
     const carol = new Client('Carol');
@@ -580,6 +690,94 @@ function makeWavDataUrl() {
     ok('normalised call declines cleanly', true);
     vera.close();
     victor.close();
+
+    console.log('\n— group calls + adding people mid-call —');
+    // Fresh members: Chloe + Dave join up front so the server knows their profiles
+    const chloe = new Client('Chloe');
+    const daveFirst = new Client('DaveFirst');
+    await chloe.connect();
+    await daveFirst.connect();
+    chloe.send({ type: 'join', name: 'Chloe' });
+    daveFirst.send({ type: 'join', name: 'Dave' });
+    await chloe.waitFor('joined');
+    await daveFirst.waitFor('joined');
+
+    alice.send({ type: 'group_create', name: 'Call Crew', members: ['Bob', 'Chloe', 'Dave'] });
+    const crew = await alice.waitFor('group_created', (e) => e.group.name === 'Call Crew');
+    const crewId = crew.group.id;
+    ok('group payload carries createdBy/createdAt for the info panel',
+      crew.group.createdBy === 'Alice' && Number.isFinite(crew.group.createdAt), JSON.stringify(crew.group));
+
+    // Dave goes offline before the call starts → he is not rung initially
+    daveFirst.close();
+    await sleep(300);
+    alice.send({ type: 'call_invite', convoId: crewId, kind: 'voice' });
+    const crewCall = await alice.waitFor('call_created', (e) => e.convoId === crewId);
+    ok('group call rings every online human member (offline one skipped)',
+      crewCall.callees.includes('Bob') && crewCall.callees.includes('Chloe') && crewCall.callees.length === 2,
+      JSON.stringify(crewCall.callees));
+    const crewCallId = crewCall.callId;
+    const chloeRing = await chloe.waitFor('call_invite', (e) => e.callId === crewCallId);
+    ok('group invite carries the group convo + kind', chloeRing.convoId === crewId && chloeRing.kind === 'voice' && chloeRing.from === 'Alice');
+
+    // Chloe answers, Bob declines — the call goes on with the two of them
+    chloe.send({ type: 'call_accept', callId: crewCallId });
+    const chloeIn = await chloe.waitFor('call_join', (e) => e.callId === crewCallId && e.isYou);
+    ok('first answerer joins the group call', chloeIn.peers.includes('Alice'));
+    bob.send({ type: 'call_reject', callId: crewCallId });
+    await alice.waitFor('call_declined', (e) => e.callId === crewCallId && e.from === 'Bob');
+    const aliceMarkAfterDecline = alice.events.length;
+    await sleep(300);
+    ok('one member declining does not end a group call',
+      !alice.events.slice(aliceMarkAfterDecline).some((e) => e.type === 'call_ended' && e.callId === crewCallId));
+
+    // Dave comes back online and Alice pulls him into the live call
+    const daveBack = new Client('DaveBack');
+    await daveBack.connect();
+    daveBack.send({ type: 'join', name: 'Dave' });
+    await daveBack.waitFor('joined');
+    alice.send({ type: 'call_add', callId: crewCallId, to: ['Dave'] });
+    const daveRing = await daveBack.waitFor('call_invite', (e) => e.callId === crewCallId);
+    ok('member offline at call start can be added to an ongoing call', daveRing.from === 'Alice' && daveRing.kind === 'voice');
+    const ringNote = await alice.waitFor('call_peer_ringing', (e) => e.callId === crewCallId);
+    ok('existing talkers are told who is being rung', (ringNote.names || []).includes('Dave'));
+
+    daveBack.send({ type: 'call_accept', callId: crewCallId });
+    const daveIn = await daveBack.waitFor('call_join', (e) => e.callId === crewCallId && e.isYou);
+    ok('added member gets the full mesh of peers', daveIn.peers.includes('Alice') && daveIn.peers.includes('Chloe'),
+      JSON.stringify(daveIn.peers));
+    await alice.waitFor('call_join', (e) => e.callId === crewCallId && e.offerTo === 'Dave');
+    await chloe.waitFor('call_join', (e) => e.callId === crewCallId && e.offerTo === 'Dave');
+    ok('everyone already in the call offers to the late joiner', true);
+
+    // guards: adding a bot / someone already in / a stranger changes nothing
+    const chloeMark = chloe.events.length;
+    alice.send({ type: 'call_add', callId: crewCallId, to: ['Aria', 'Dave', 'Ghost'] });
+    await sleep(300);
+    ok('bot / duplicate / non-member add targets are ignored',
+      !chloe.events.slice(chloeMark).some((e) => e.type === 'call_peer_ringing'));
+
+    // Chloe hangs up — Alice and Dave keep talking
+    chloe.send({ type: 'call_leave', callId: crewCallId });
+    await daveBack.waitFor('call_peer_left', (e) => e.callId === crewCallId && e.name === 'Chloe');
+    const aliceMarkAfterLeave = alice.events.length;
+    await sleep(300);
+    ok('group call continues while 2+ members remain',
+      !alice.events.slice(aliceMarkAfterLeave).some((e) => e.type === 'call_ended' && e.callId === crewCallId));
+
+    // Dave hangs up — Alice is alone → call ends and is logged
+    daveBack.send({ type: 'call_leave', callId: crewCallId });
+    const crewEnd = await alice.waitFor('call_ended', (e) => e.callId === crewCallId);
+    ok('call ends when fewer than 2 talkers remain', crewEnd.reason === 'ended', JSON.stringify(crewEnd));
+    alice.send({ type: 'history', convoId: crewId });
+    const crewHist = await alice.waitFor('history', (e) => e.convoId === crewId && (e.messages || []).some((m) => m.kind === 'call'));
+    const crewLog = crewHist.messages.filter((m) => m.kind === 'call').pop();
+    ok('group call log lists everyone who picked up',
+      crewLog.media.members.includes('Alice') && crewLog.media.members.includes('Chloe') && crewLog.media.members.includes('Dave'),
+      JSON.stringify(crewLog.media.members));
+
+    chloe.close();
+    daveBack.close();
 
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
