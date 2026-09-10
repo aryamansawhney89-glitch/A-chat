@@ -6,7 +6,8 @@
  *   join → DM + delivered/read receipts → group create + group message +
  *   aggregated receipts → photo upload + message (bot reacts) → voice upload
  *   + message (bot reacts) → profile picture broadcast → voice call signalling
- *   (invite/accept/SDP relay/hang-up/missed) → oversized upload rejected →
+ *   (invite/accept/SDP relay/hang-up/missed) → video call signalling (kind
+ *   end-to-end, history callKind, voice default) → oversized upload rejected →
  *   JSON persistence (with legacy messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
@@ -519,6 +520,66 @@ function makeWavDataUrl() {
     const declined = await alice.waitFor('call_ended', (e) => e.callId === created3.callId, 8000);
     ok('declined call ends for the caller with reason "declined"', declined.reason === 'declined');
     dora.close();
+
+    console.log('\n— video call signalling —');
+    // Fresh users so every convoId below is new (waitFor also scans old events).
+    const vera = new Client('Vera');
+    const victor = new Client('Victor');
+    await vera.connect();
+    await victor.connect();
+    vera.send({ type: 'join', name: 'Vera' });
+    victor.send({ type: 'join', name: 'Victor' });
+    await vera.waitFor('joined');
+    await victor.waitFor('joined');
+    const dmVV = 'dm::Vera::Victor';
+
+    vera.send({ type: 'call_invite', convoId: dmVV, kind: 'video' });
+    const vCreated = await vera.waitFor('call_created', (e) => e.convoId === dmVV);
+    ok('video invite yields call_created with kind "video"',
+      vCreated.kind === 'video' && typeof vCreated.callId === 'string', JSON.stringify(vCreated));
+    const vInvite = await victor.waitFor('call_invite', (e) => e.callId === vCreated.callId);
+    ok('callee rung with kind "video"', vInvite.kind === 'video' && vInvite.from === 'Vera');
+
+    victor.send({ type: 'call_accept', callId: vCreated.callId });
+    const vJoinVictor = await victor.waitFor('call_join', (e) => e.callId === vCreated.callId && e.isYou === true);
+    ok('video answerer join echoes kind "video"', vJoinVictor.kind === 'video' && vJoinVictor.peers.includes('Vera'));
+    const vJoinVera = await vera.waitFor('call_join', (e) => e.callId === vCreated.callId && e.isYou === false);
+    ok('video caller told to offer (kind echoed)',
+      vJoinVera.offerTo === 'Victor' && vJoinVera.kind === 'video', JSON.stringify(vJoinVera));
+
+    vera.send({ type: 'call_signal', callId: vCreated.callId, to: 'Victor', sdp: { type: 'offer', sdp: 'v=0\r\nfake-video-sdp' } });
+    const vSdp = await victor.waitFor('call_signal', (e) => e.callId === vCreated.callId && e.sdp);
+    ok('SDP offer relayed on a video call', vSdp.from === 'Vera' && vSdp.sdp.type === 'offer');
+
+    victor.send({ type: 'call_leave', callId: vCreated.callId });
+    const vEnded = await vera.waitFor('call_ended', (e) => e.callId === vCreated.callId);
+    ok('video hang-up ends the call with kind "video"', vEnded.reason === 'ended' && vEnded.kind === 'video');
+    vera.send({ type: 'history', convoId: dmVV });
+    const vHist = await vera.waitFor('history', (e) => e.convoId === dmVV && (e.messages || []).some((m) => m.kind === 'call'));
+    const vCallMsg = vHist.messages.filter((m) => m.kind === 'call').pop();
+    ok('video call logged with callKind "video" + participants',
+      vCallMsg.media.callKind === 'video' && vCallMsg.media.status === 'completed' &&
+      vCallMsg.media.members.includes('Vera') && vCallMsg.media.members.includes('Victor'));
+
+    // Backwards compatibility: invites without kind (old clients) are voice.
+    vera.send({ type: 'call_invite', convoId: dmVV });
+    const wCreated = await vera.waitFor('call_created', (e) => e.convoId === dmVV && e.callId !== vCreated.callId);
+    ok('invite without kind defaults to "voice"', wCreated.kind === 'voice');
+    const wInvite = await victor.waitFor('call_invite', (e) => e.callId === wCreated.callId);
+    ok('defaulted invite reaches the callee as "voice"', wInvite.kind === 'voice');
+    victor.send({ type: 'call_reject', callId: wCreated.callId });
+    const wEnded = await vera.waitFor('call_ended', (e) => e.callId === wCreated.callId, 8000);
+    ok('defaulted voice call declines cleanly', wEnded.reason === 'declined' && wEnded.kind === 'voice');
+
+    // ... and so is any unknown kind value.
+    vera.send({ type: 'call_invite', convoId: dmVV, kind: 'hologram' });
+    const hCreated = await vera.waitFor('call_created', (e) => e.callId !== vCreated.callId && e.callId !== wCreated.callId);
+    ok('unknown kind normalised to "voice"', hCreated.kind === 'voice');
+    victor.send({ type: 'call_reject', callId: hCreated.callId });
+    await vera.waitFor('call_ended', (e) => e.callId === hCreated.callId, 8000);
+    ok('normalised call declines cleanly', true);
+    vera.close();
+    victor.close();
 
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save

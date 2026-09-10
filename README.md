@@ -24,7 +24,12 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
   screen with answer/decline, ringing tone, call timer, mute & speaker controls,
   busy/offline handling and a "no answer" timeout. Group chats get mesh calls (up to 8
   people). Every call leaves a log entry in the chat — 📞 Voice call · 0:42, ❌ missed,
-  📵 declined — and shows up in the sidebar preview too player
+  📵 declined — and shows up in the sidebar preview too
+- **Video calls 🎥** — tap 🎥 for a peer-to-peer WebRTC video call: live camera tiles
+  for you (mirrored preview) and every peer, camera on/off toggle, plus the same
+  mute/speaker controls, ringing screen, timer and busy/offline handling as voice
+  calls. Group video works over the same mesh (up to 8 people). Calls are logged as
+  🎥 Video call · 0:42 / ❌ Missed video call entries in the chat and sidebar
 - **Profile pictures 👤** — click your own avatar to upload (client-resized to 256px),
   persisted per user in `data/users.json` and broadcast to everyone; the three bots
   ship with SVG avatars
@@ -57,9 +62,9 @@ npm start        # serves on http://localhost:3000
 Open the page, pick a name, and start chatting. Open a **second browser tab with a
 different name** to chat live between two users — messages, typing indicators and
 read receipts all update in real time. Try creating a group with the 👥 button,
-sending a photo with 📎, recording a 🎤 voice note, or placing a 📞 voice call.
-(Allow microphone access; calls are peer-to-peer over WebRTC with STUN, so they work
-on the same machine/network and across typical NATs.)
+sending a photo with 📎, recording a 🎤 voice note, or placing a 📞 voice / 🎥 video call.
+(Allow camera and microphone access; calls are peer-to-peer over WebRTC with STUN, so
+they work on the same machine/network and across typical NATs.)
 
 ### Smoke test
 
@@ -88,7 +93,7 @@ Start `npm start`, Plan **Free** → **Deploy**.
 ## How it works
 
 - `server.js` — Express static host + `ws` WebSocket router + `/api/upload` + WebRTC
-  call signalling relay. Every message carries a `convoId`: `dm::A::B` (two
+  call signalling relay (`kind: "voice" | "video"` on every call frame). Every message carries a `convoId`: `dm::A::B` (two
   participants), `grp::<id>` (group), or `room::<id>` (password-protected room).
   Presence, typing and per-member delivered/read receipts (`deliveredBy` / `readBy`
   arrays) travel as JSON frames; history, groups, profiles, reactions, accounts and
@@ -96,7 +101,8 @@ Start `npm start`, Plan **Free** → **Deploy**.
   with PBKDF2 (10,000 iterations, SHA-512). Uploaded media is written to `data/uploads`
   and served at `/uploads`. Calls never touch media on the server — only SDP/ICE
   signalling is relayed between participants, and each call is logged as a `kind:"call"`
-  message so both sides keep a history entry.
+  message (with `media.callKind`, status, duration and participants) so both sides
+  keep a history entry.
 - `public/` — zero-build frontend (`index.html`, `style.css`, `app.js`) plus
   `public/avatars/*.svg` for the bot profile pictures.
 - The client talks to the server over the same host/port (`ws://`/`wss://`), so it

@@ -2,7 +2,8 @@
 
 /* ================================ A-Chat client ================================
    Supports DMs + group chats (convoId routing), photo sharing with captions,
-   voice messages with waveform players, and profile pictures.               */
+   voice messages with waveform players, profile pictures, and voice/video
+   calls over WebRTC (signalling relayed by the server).                     */
 
 const $ = (id) => document.getElementById(id);
 
@@ -42,7 +43,7 @@ const state = {
   ws: null,
   connected: false,
   recording: false,
-  incoming: null,       // pending incoming voice call invite
+  incoming: null,       // pending incoming voice/video call invite {callId, convoId, from, callees, kind}
   authenticated: false,
   authToken: null,
   authUsername: null,
@@ -462,12 +463,13 @@ function handle(msg) {
       break;
     }
 
-    /* ---- voice call signalling ---- */
+    /* ---- voice/video call signalling ---- */
 
     case 'call_created': {
       // server accepted our invite and is ringing the other side
       if (!activeCall.convoId) break;
       activeCall.id = msg.callId;
+      if (msg.kind === 'video' || msg.kind === 'voice') activeCall.kind = msg.kind;
       activeCall.status = 'calling';
       setCallStatus('Ringing…');
       break;
@@ -479,7 +481,10 @@ function handle(msg) {
         break;
       }
       if (msg.from === state.me) break;
-      state.incoming = { callId: msg.callId, convoId: msg.convoId, from: msg.from, callees: msg.callees || [] };
+      state.incoming = {
+        callId: msg.callId, convoId: msg.convoId, from: msg.from, callees: msg.callees || [],
+        kind: msg.kind === 'video' ? 'video' : 'voice',
+      };
       showIncoming(state.incoming);
       startRing();
       break;
@@ -554,11 +559,15 @@ function handle(msg) {
       const ringing = state.incoming && state.incoming.callId === msg.callId;
       if (!mine && !ringing) break;
       const duration = Number(msg.duration) || 0;
+      const wasVideo = activeCall.kind === 'video'
+        || (state.incoming && state.incoming.kind === 'video')
+        || msg.kind === 'video';
       teardownCall();
+      const word = wasVideo ? 'Video call' : 'Call';
       const label = msg.reason === 'timeout' ? 'No answer'
-        : msg.reason === 'declined' ? 'Call declined'
-        : msg.reason === 'cancelled' ? 'Call cancelled'
-        : 'Call ended';
+        : msg.reason === 'declined' ? `${word} declined`
+        : msg.reason === 'cancelled' ? `${word} cancelled`
+        : `${word} ended`;
       toast(duration > 0 ? `${label} · ${fmtDur(duration)}` : label);
       break;
     }
@@ -624,16 +633,20 @@ function previewText(m) {
   return m.text;
 }
 
-// "📞 Voice call · 1:23" / "❌ Missed voice call" — also used by the bubble.
+// "📞 Voice call · 1:23" / "🎥 Video call · 0:42" / "❌ Missed video call" —
+// also used by the sidebar preview. Entries logged before video calls
+// existed carry no callKind and render as voice calls.
 function callParts(m) {
   const media = m.media || {};
   const status = media.status || 'completed';
+  const callKind = media.callKind === 'video' ? 'video' : 'voice';
+  const Kind = callKind === 'video' ? 'Video call' : 'Voice call';
   const missed = status !== 'completed';
   const dur = Number(media.duration) || 0;
-  const icon = status === 'declined' ? '📵' : missed ? '❌' : '📞';
-  const label = status === 'declined' ? 'Declined voice call'
-    : status === 'cancelled' ? 'Cancelled voice call'
-    : missed ? 'Missed voice call' : 'Voice call';
+  const icon = status === 'declined' ? '📵' : missed ? '❌' : (callKind === 'video' ? '🎥' : '📞');
+  const label = status === 'declined' ? `Declined ${callKind} call`
+    : status === 'cancelled' ? `Cancelled ${callKind} call`
+    : missed ? `Missed ${callKind} call` : Kind;
   return { icon, label, dur, missed };
 }
 
@@ -1542,27 +1555,33 @@ micBtn.addEventListener('click', startRecording);
 recCancelBtn.addEventListener('click', () => stopRecording(false));
 recSendBtn.addEventListener('click', () => stopRecording(true));
 
-/* ------------------------------ voice calls --------------------------------
-   Peer-to-peer WebRTC audio. The server (server.js) only relays SDP/ICE
-   signalling between participants of the same conversation, so no media ever
-   touches it. Group calls use a small mesh (one RTCPeerConnection per peer);
-   whoever joined the call first creates the offer for whoever joined later. */
+/* --------------------------- voice & video calls -----------------------------
+   Peer-to-peer WebRTC audio (+ camera video on video calls). The server
+   (server.js) only relays SDP/ICE signalling between participants of the same
+   conversation, so no media ever touches it. Group calls use a small mesh (one
+   RTCPeerConnection per peer); whoever joined the call first creates the offer
+   for whoever joined later. */
 
 const callBtn = $('callBtn');
+const videoCallBtn = $('videoCallBtn');
 const incomingCallModal = $('incomingCallModal');
+const incomingKindEl = $('incomingKind');
 const incomingAvatarEl = $('incomingAvatar');
 const incomingNameEl = $('incomingName');
 const incomingStateEl = $('incomingState');
 const acceptCallBtn = $('acceptCallBtn');
 const declineCallBtn = $('declineCallBtn');
 const callOverlay = $('callOverlay');
+const callCardEl = $('callCard');
 const callKindEl = $('callKind');
 const callAvatarEl = $('callAvatar');
 const callNameEl = $('callName');
 const callStateEl = $('callState');
+const callVideoGrid = $('callVideoGrid');
 const callTimerEl = $('callTimer');
 const callPeersEl = $('callPeers');
 const muteBtn = $('muteBtn');
+const cameraBtn = $('cameraBtn');
 const endCallBtn = $('endCallBtn');
 const speakerBtn = $('speakerBtn');
 
@@ -1577,23 +1596,28 @@ const ICE_SERVERS = [
 const activeCall = {
   id: null,
   convoId: null,
+  kind: 'voice',       // 'voice' | 'video'
   direction: null,     // 'in' | 'out'
   status: 'idle',      // 'idle' | 'dialling' | 'calling' | 'connecting' | 'connected'
   startedAt: 0,
   timer: null,
-  peers: new Map(),    // name -> {pc, audio, pending[]}
+  peers: new Map(),    // name -> {pc, audio, tile, pending[]}
   localStream: null,
+  localTile: null,
   muted: false,
+  cameraOff: false,
   speaker: false,
   sinkId: null,
 };
 
-async function getMicStream() {
+// Video wants a modest 640x480 — enough for a chat tile, light on the mesh.
+async function getCallStream(wantVideo) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error('Voice calls need a browser with microphone support');
+    throw new Error(`${wantVideo ? 'Video' : 'Voice'} calls need a browser with camera and microphone support`);
   }
   return navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: wantVideo ? { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' } : false,
   });
 }
 
@@ -1608,11 +1632,12 @@ function callIdentity(convoId) {
 function ensurePeer(name) {
   if (activeCall.peers.has(name)) return activeCall.peers.get(name);
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  const peer = { pc, audio: null, pending: [] };
+  const peer = { pc, audio: null, tile: null, pending: [] };
   activeCall.peers.set(name, peer);
 
   if (activeCall.localStream) {
-    for (const t of activeCall.localStream.getAudioTracks()) pc.addTrack(t, activeCall.localStream);
+    // every local track — audio always, plus camera on video calls
+    for (const t of activeCall.localStream.getTracks()) pc.addTrack(t, activeCall.localStream);
   }
   pc.onicecandidate = (e) => {
     if (!e.candidate || !activeCall.id) return;
@@ -1627,7 +1652,7 @@ function ensurePeer(name) {
       },
     });
   };
-  pc.ontrack = (e) => attachRemoteAudio(name, e.streams[0] || new MediaStream([e.track]));
+  pc.ontrack = (e) => attachRemoteStream(name, e.streams[0] || new MediaStream([e.track]));
   pc.onconnectionstatechange = () => {
     if (!activeCall.id) return;
     if (pc.connectionState === 'failed') setCallStatus('Connection lost — reconnecting…', true);
@@ -1637,18 +1662,29 @@ function ensurePeer(name) {
   return peer;
 }
 
-function attachRemoteAudio(name, stream) {
+function attachRemoteStream(name, stream) {
   const peer = activeCall.peers.get(name);
   if (!peer) return;
-  if (!peer.audio) {
+  if (activeCall.kind === 'video') {
+    // The tile's <video> plays the peer's audio too, so it doubles as the
+    // sound sink (volume / speaker routing below just works).
+    const tile = ensureVideoTile(name, false);
+    peer.tile = tile;
+    const video = tile.querySelector('video');
+    video.srcObject = stream;
+    peer.audio = video;
+    updateTileAvatar(tile, stream.getVideoTracks().length > 0);
+  } else if (!peer.audio) {
     const el = document.createElement('audio');
     el.className = 'remote-audio';
     el.autoplay = true;
     el.playsInline = true;
     document.body.appendChild(el);
     peer.audio = el;
+    peer.audio.srcObject = stream;
+  } else {
+    peer.audio.srcObject = stream;
   }
-  peer.audio.srcObject = stream;
   peer.audio.volume = activeCall.speaker ? 1 : 0.9;
   applySpeakerSink();
   const p = peer.audio.play();
@@ -1658,7 +1694,10 @@ function attachRemoteAudio(name, stream) {
 async function offerToPeer(name) {
   const peer = ensurePeer(name);
   try {
-    const offer = await peer.pc.createOffer({ offerToReceiveAudio: true });
+    const offer = await peer.pc.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: activeCall.kind === 'video',
+    });
     await peer.pc.setLocalDescription(offer);
     wsSend({ type: 'call_signal', callId: activeCall.id, to: name, sdp: peer.pc.localDescription });
   } catch (err) {
@@ -1694,27 +1733,113 @@ function dropPeer(name) {
   const peer = activeCall.peers.get(name);
   if (!peer) return;
   try { peer.pc.close(); } catch { /* already closed */ }
-  if (peer.audio) {
+  if (peer.tile) {
+    // a video tile owns its <video> element — remove the whole tile
+    const video = peer.tile.querySelector('video');
+    if (video) video.srcObject = null;
+    peer.tile.remove();
+    peer.tile = null;
+    peer.audio = null;
+  } else if (peer.audio) {
     peer.audio.srcObject = null;
     peer.audio.remove();
+    peer.audio = null;
   }
   activeCall.peers.delete(name);
   renderCallPeers();
+}
+
+/* ---- video tiles ---- */
+
+function makeVideoTile(name, isLocal) {
+  const tile = document.createElement('div');
+  tile.className = 'call-video-tile' + (isLocal ? ' local' : '');
+  const video = document.createElement('video');
+  video.autoplay = true;
+  video.playsInline = true;
+  if (isLocal) {
+    video.muted = true; // never feed our own camera audio back to us
+    video.setAttribute('aria-label', 'Your camera preview');
+  }
+  const avatar = document.createElement('div');
+  avatar.className = 'call-video-avatar hidden';
+  avatar.textContent = initialOf(isLocal ? (state.me || '?') : name);
+  avatar.style.background = avatarColor(isLocal ? (state.me || '?') : name);
+  const label = document.createElement('span');
+  label.className = 'call-video-label';
+  label.textContent = isLocal ? 'You' : name;
+  tile.append(video, avatar, label);
+  return tile;
+}
+
+// Reuse a peer's existing tile when ontrack fires again (renegotiation etc.).
+function ensureVideoTile(name, isLocal) {
+  if (isLocal && activeCall.localTile && activeCall.localTile.isConnected) return activeCall.localTile;
+  if (!isLocal) {
+    const peer = activeCall.peers.get(name);
+    if (peer && peer.tile && peer.tile.isConnected) return peer.tile;
+  }
+  const tile = makeVideoTile(name, isLocal);
+  callVideoGrid.appendChild(tile);
+  if (isLocal) activeCall.localTile = tile;
+  else {
+    const peer = activeCall.peers.get(name);
+    if (peer) peer.tile = tile;
+  }
+  return tile;
+}
+
+function updateTileAvatar(tile, hasVideo) {
+  const avatar = tile.querySelector('.call-video-avatar');
+  const video = tile.querySelector('video');
+  tile.classList.toggle('camera-off', !hasVideo);
+  if (avatar) avatar.classList.toggle('hidden', hasVideo);
+  if (video) video.classList.toggle('hidden', !hasVideo);
+}
+
+// Our own preview follows the camera toggle.
+function updateLocalTile() {
+  if (!activeCall.localTile) return;
+  const tracks = activeCall.localStream ? activeCall.localStream.getVideoTracks() : [];
+  updateTileAvatar(activeCall.localTile, tracks.length > 0 && !activeCall.cameraOff);
+}
+
+function clearVideoGrid() {
+  callVideoGrid.innerHTML = '';
+  activeCall.localTile = null;
 }
 
 /* ---- overlay + timer ---- */
 
 function showCallOverlay() {
   const id = callIdentity(activeCall.convoId);
-  callKindEl.textContent = activeCall.direction === 'out' ? 'Outgoing voice call' : 'Voice call';
+  const isVideo = activeCall.kind === 'video';
+  const kindWord = isVideo ? 'Video call' : 'Voice call';
+  callKindEl.textContent = activeCall.direction === 'out' ? `Outgoing ${callKindWord()}` : kindWord;
   applyAvatar(callAvatarEl, id.key, id.pic, id.group ? '👥' : undefined);
   callNameEl.textContent = id.title;
   callTimerEl.textContent = '0:00';
   callTimerEl.classList.add('hidden');
+  callCardEl.classList.toggle('video', isVideo);
+  callVideoGrid.classList.toggle('hidden', !isVideo);
+  cameraBtn.classList.toggle('hidden', !isVideo);
+  if (isVideo && activeCall.localStream) {
+    const tile = ensureVideoTile(state.me, true);
+    const preview = tile.querySelector('video');
+    preview.srcObject = activeCall.localStream;
+    updateLocalTile();
+    const p = preview.play();
+    if (p && p.catch) p.catch(() => { /* preview will start on user gesture */ });
+  }
   callOverlay.classList.remove('hidden');
   updateMuteBtn();
+  updateCameraBtn();
   updateSpeakerBtn();
   renderCallPeers();
+}
+
+function callKindWord() {
+  return activeCall.kind === 'video' ? 'video call' : 'voice call';
 }
 
 function setCallStatus(text, isError) {
@@ -1733,6 +1858,7 @@ function startCallTimer() {
 
 function renderCallPeers() {
   callPeersEl.innerHTML = '';
+  if (activeCall.kind === 'video') return; // video tiles already carry name labels
   if (activeCall.peers.size < 2) return; // a 1:1 call needs no participant chips
   const add = (name, isYou) => {
     const chip = document.createElement('span');
@@ -1747,6 +1873,11 @@ function renderCallPeers() {
 function updateMuteBtn() {
   muteBtn.classList.toggle('off', activeCall.muted);
   muteBtn.title = activeCall.muted ? 'Unmute' : 'Mute';
+}
+
+function updateCameraBtn() {
+  cameraBtn.classList.toggle('off', activeCall.cameraOff);
+  cameraBtn.title = activeCall.cameraOff ? 'Turn camera on' : 'Turn camera off';
 }
 
 function updateSpeakerBtn() {
@@ -1780,6 +1911,7 @@ function stopRing() {
 
 function showIncoming(inv) {
   const u = findUser(inv.from);
+  incomingKindEl.textContent = inv.kind === 'video' ? 'Incoming video call 🎥' : 'Incoming voice call';
   applyAvatar(incomingAvatarEl, inv.from, u ? u.pic : null);
   incomingNameEl.textContent = inv.from;
   const others = (inv.callees || []).filter((n) => n !== state.me);
@@ -1795,20 +1927,22 @@ async function acceptIncoming() {
   const inv = state.incoming;
   if (!inv) return;
   state.incoming = null;
+  const wantVideo = inv.kind === 'video';
   let stream;
   try {
-    stream = await getMicStream();
+    stream = await getCallStream(wantVideo);
   } catch (err) {
     wsSend({ type: 'call_reject', callId: inv.callId });
     hideIncoming();
     stopRing();
-    toast(err.message || 'Microphone permission denied');
+    toast(wantVideo ? 'Camera or microphone unavailable' : (err.message || 'Microphone permission denied'));
     return;
   }
   hideIncoming();
   stopRing();
   activeCall.id = inv.callId;
   activeCall.convoId = inv.convoId;
+  activeCall.kind = wantVideo ? 'video' : 'voice';
   activeCall.direction = 'in';
   activeCall.status = 'connecting';
   activeCall.localStream = stream;
@@ -1827,25 +1961,27 @@ function declineIncoming() {
 
 /* ---- placing / ending ---- */
 
-async function startCall() {
+async function startCall(kind) {
   if (!state.active) return;
   if (activeCall.id || activeCall.status !== 'idle') { toast('You are already on a call'); return; }
   if (state.recording) stopRecording(false);
+  const wantVideo = kind === 'video';
   const convoId = state.active;
   let stream;
   try {
-    stream = await getMicStream();
+    stream = await getCallStream(wantVideo);
   } catch (err) {
-    toast(err.message || 'Microphone permission denied');
+    toast(wantVideo ? 'Camera or microphone unavailable' : (err.message || 'Microphone permission denied'));
     return;
   }
   activeCall.localStream = stream;
   activeCall.convoId = convoId;
+  activeCall.kind = wantVideo ? 'video' : 'voice';
   activeCall.direction = 'out';
   activeCall.status = 'dialling';
   showCallOverlay();
   setCallStatus('Calling…');
-  wsSend({ type: 'call_invite', convoId });
+  wsSend({ type: 'call_invite', convoId, kind: activeCall.kind });
 }
 
 // Local hang-up: tell the server, then tear everything down.
@@ -1858,19 +1994,25 @@ function teardownCall() {
   for (const name of [...activeCall.peers.keys()]) dropPeer(name);
   activeCall.peers.clear();
   if (activeCall.localStream) {
-    activeCall.localStream.getTracks().forEach((t) => t.stop());
+    activeCall.localStream.getTracks().forEach((t) => t.stop()); // mic + camera
     activeCall.localStream = null;
   }
+  clearVideoGrid();
   clearInterval(activeCall.timer);
   activeCall.timer = null;
   activeCall.id = null;
   activeCall.convoId = null;
+  activeCall.kind = 'voice';
   activeCall.direction = null;
   activeCall.status = 'idle';
   activeCall.startedAt = 0;
   activeCall.muted = false;
+  activeCall.cameraOff = false;
   activeCall.speaker = false;
   activeCall.sinkId = null;
+  callCardEl.classList.remove('video');
+  callVideoGrid.classList.add('hidden');
+  cameraBtn.classList.add('hidden');
   callOverlay.classList.add('hidden');
   callPeersEl.innerHTML = '';
   hideIncoming();
@@ -1891,6 +2033,16 @@ async function toggleMute() {
   setCallStatus(activeCall.muted ? 'Muted' : 'Connected');
 }
 
+async function toggleCamera() {
+  if (!activeCall.localStream) return;
+  const tracks = activeCall.localStream.getVideoTracks();
+  if (!tracks.length) { toast('No camera in this call'); return; }
+  activeCall.cameraOff = !activeCall.cameraOff;
+  for (const t of tracks) t.enabled = !activeCall.cameraOff;
+  updateCameraBtn();
+  updateLocalTile();
+}
+
 async function toggleSpeaker() {
   activeCall.speaker = !activeCall.speaker;
   if (activeCall.speaker && !activeCall.sinkId && navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
@@ -1906,21 +2058,25 @@ async function toggleSpeaker() {
   updateSpeakerBtn();
 }
 
-// Hide the 📞 button where a call makes no sense (DMs with the demo bots).
+// Hide the 📞/🎥 buttons where a call makes no sense (DMs with the demo bots).
 function updateCallBtn() {
   const meta = state.active ? metaFor(state.active) : null;
   let show = false;
-  let title = 'Voice call';
+  let voiceTitle = 'Voice call';
+  let videoTitle = 'Video call';
   if (meta && meta.kind === 'dm') {
     const other = meta.title;
     show = !findUserBy(other, (u) => u.bot);
   } else if (meta) {
     const humans = meta.members.filter((n) => n !== state.me && !findUserBy(n, (u) => u.bot));
     show = humans.length > 0;
-    title = 'Start group call';
+    voiceTitle = 'Start group voice call';
+    videoTitle = 'Start group video call';
   }
   callBtn.classList.toggle('hidden', !show);
-  callBtn.title = title;
+  callBtn.title = voiceTitle;
+  videoCallBtn.classList.toggle('hidden', !show);
+  videoCallBtn.title = videoTitle;
 }
 
 function findUserBy(name, pred) {
@@ -1928,11 +2084,13 @@ function findUserBy(name, pred) {
   return u ? pred(u) : false;
 }
 
-callBtn.addEventListener('click', startCall);
+callBtn.addEventListener('click', () => startCall('voice'));
+videoCallBtn.addEventListener('click', () => startCall('video'));
 acceptCallBtn.addEventListener('click', acceptIncoming);
 declineCallBtn.addEventListener('click', declineIncoming);
 endCallBtn.addEventListener('click', hangUp);
 muteBtn.addEventListener('click', toggleMute);
+cameraBtn.addEventListener('click', toggleCamera);
 speakerBtn.addEventListener('click', toggleSpeaker);
 
 // A closing tab must not leave the other side ringing forever.
