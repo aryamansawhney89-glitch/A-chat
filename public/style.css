@@ -1088,6 +1088,149 @@ html[data-theme="dark"] .room-notice span {
   background: rgba(0, 168, 132, 0.15);
 }
 
+/* ---------------- Voice calls ---------------- */
+
+.call-btn { color: var(--accent-dark); }
+html[data-theme="dark"] .call-btn { color: var(--accent); }
+
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: radial-gradient(circle at 50% 22%, #1f2c34 0%, #0b141a 62%);
+  color: #e9edef;
+}
+
+.call-card {
+  width: min(380px, 94vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+  padding: 30px 26px 34px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.45);
+}
+
+.call-kind {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #8696a0;
+}
+
+.call-avatar {
+  width: 104px;
+  height: 104px;
+  border-radius: 50%;
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 42px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  background-size: cover;
+  background-position: center;
+  box-shadow: 0 0 0 8px rgba(0, 168, 132, 0.14);
+}
+
+.call-name { font-size: 24px; font-weight: 600; margin-top: 4px; }
+.call-state { font-size: 14px; color: #aebac1; min-height: 20px; }
+.call-state.connected { color: var(--accent); }
+.call-state.error { color: #f15c6d; }
+
+.call-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  min-height: 22px;
+}
+.call-timer.hidden { display: none !important; }
+
+.call-peers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+  min-height: 22px;
+}
+.call-peer-chip {
+  font-size: 11.5px;
+  padding: 3px 10px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #d1d7db;
+}
+.call-peer-chip.you { background: rgba(0, 168, 132, 0.28); color: #b7f5e6; }
+
+.call-actions, .call-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 26px;
+  margin-top: 22px;
+}
+
+.call-round {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.14);
+  color: #e9edef;
+  transition: transform 0.12s, background 0.12s;
+}
+.call-round:hover { transform: scale(1.06); background: rgba(255, 255, 255, 0.22); }
+.call-round.accept { background: #00a884; color: #fff; }
+.call-round.accept:hover { background: #06cf9c; }
+.call-round.decline { background: #ea4c5f; color: #fff; }
+.call-round.decline:hover { background: #ff6176; }
+.call-round.off { background: #fff; color: #111b21; }
+
+#incomingCallModal .call-avatar { animation: callPulse 1.5s ease-out infinite; }
+@keyframes callPulse {
+  0% { box-shadow: 0 0 0 0 rgba(0, 168, 132, 0.42); }
+  70% { box-shadow: 0 0 0 26px rgba(0, 168, 132, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 168, 132, 0); }
+}
+
+/* remote audio sinks live here, out of the way */
+.remote-audio { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+/* call log entries in the message list */
+.bubble.call-bubble {
+  background: rgba(233, 237, 239, 0.55);
+  color: var(--text);
+  min-width: 190px;
+  cursor: default;
+}
+html[data-theme="dark"] .bubble.call-bubble { background: rgba(32, 44, 51, 0.8); }
+.call-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14.5px;
+}
+.call-line .call-ico { font-size: 15px; line-height: 1; }
+.call-line.missed .call-ico { color: #ea4c5f; }
+.call-line.ok .call-ico { color: var(--accent-dark); }
+html[data-theme="dark"] .call-line.ok .call-ico { color: var(--accent); }
+.call-line .call-label { white-space: nowrap; }
+.call-line .call-dur { color: var(--text-soft); font-size: 13px; }
+
 /* ---------------- Small screens ---------------- */
 
 @media (max-width: 900px) {

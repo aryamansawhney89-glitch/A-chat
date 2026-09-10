@@ -5,8 +5,9 @@
  * exercises it with two WebSocket clients:
  *   join → DM + delivered/read receipts → group create + group message +
  *   aggregated receipts → photo upload + message (bot reacts) → voice upload
- *   + message (bot reacts) → profile picture broadcast → oversized upload
- *   rejected → JSON persistence (with legacy messages.json migration).
+ *   + message (bot reacts) → profile picture broadcast → voice call signalling
+ *   (invite/accept/SDP relay/hang-up/missed) → oversized upload rejected →
+ *   JSON persistence (with legacy messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
  */
@@ -141,7 +142,7 @@ function makeWavDataUrl() {
   console.log(`Starting server on :${PORT} (data: ${dataDir})`);
   const server = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
+    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, CALL_RING_TIMEOUT_MS: '1500' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', (d) => process.stdout.write('[server] ' + d));
@@ -242,6 +243,30 @@ function makeWavDataUrl() {
     console.log('\n— voice notes —');
     const up2 = await httpPostJson(PORT, '/api/upload', { dataUrl: makeWavDataUrl(), name: 'clip.wav' });
     ok('audio upload accepted (.wav)', up2.status === 200 && up2.json.ok && up2.json.url.endsWith('.wav'));
+
+    // MediaRecorder keeps codec params in the blob type and FileReader copies
+    // them into the data URL — the upload must not reject those.
+    const WAV_B64 = makeWavDataUrl().split(',')[1];
+    const opusWebm = await httpPostJson(PORT, '/api/upload', {
+      dataUrl: `data:audio/webm;codecs=opus;base64,${WAV_B64}`, name: 'voice-note.webm',
+    });
+    ok('data URL with codec params accepted (audio/webm;codecs=opus)',
+      opusWebm.status === 200 && opusWebm.json.ok && opusWebm.json.url.endsWith('.webm'),
+      JSON.stringify(opusWebm.json));
+    const opusWebmServed = await httpGet(PORT, opusWebm.json.url);
+    ok('voice note served as audio/webm (playable in <audio>)',
+      opusWebmServed.status === 200 && (opusWebmServed.headers['content-type'] || '').startsWith('audio/webm'),
+      opusWebmServed.headers['content-type']);
+    ok('voice note supports range requests (seeking)',
+      (opusWebmServed.headers['accept-ranges'] || '') === 'bytes');
+    const safariMp4 = await httpPostJson(PORT, '/api/upload', {
+      dataUrl: `data:audio/mp4;codecs=mp4a.40.2;base64,${WAV_B64}`, name: 'voice-note.m4a',
+    });
+    ok('Safari data URL accepted (audio/mp4;codecs=mp4a.40.2)',
+      safariMp4.status === 200 && safariMp4.json.ok && safariMp4.json.url.endsWith('.m4a'),
+      JSON.stringify(safariMp4.json));
+    const junkUrl = await httpPostJson(PORT, '/api/upload', { dataUrl: 'data:audio/webm;base64,not-base64!!' });
+    ok('malformed base64 payload still rejected (400)', junkUrl.status === 400);
     const wave = Array.from({ length: 40 }, (_, i) => ((i % 5) + 1) * 18);
     alice.send({ type: 'message', convoId: dmAB, kind: 'voice', text: '', media: { url: up2.json.url, duration: 1.2, wave } });
     const voiceB = await bob.waitFor('message', (e) => e.message.kind === 'voice' && e.message.convoId === dmAB);
@@ -401,6 +426,99 @@ function makeWavDataUrl() {
     const staleJoin = await stale.waitFor('joined');
     ok('join with stale token falls back to name', staleJoin.name === 'Zed');
     stale.close();
+
+    console.log('\n— voice call signalling —');
+    // bots and offline users cannot answer a call
+    alice.send({ type: 'call_invite', convoId: 'dm::Alice::Aria' });
+    const botCall = await alice.waitFor('call_failed', (e) => e.convoId === 'dm::Alice::Aria');
+    ok('calling a bot reports "nobody" to call', botCall.reason === 'nobody', JSON.stringify(botCall));
+    alice.send({ type: 'call_invite', convoId: 'dm::Alice::Nobody' });
+    const offlineCall = await alice.waitFor('call_failed', (e) => e.convoId === 'dm::Alice::Nobody');
+    ok('calling an offline user reports "offline"', offlineCall.reason === 'offline', JSON.stringify(offlineCall));
+
+    // Alice rings Bob
+    alice.send({ type: 'call_invite', convoId: dmAB });
+    const created = await alice.waitFor('call_created', (e) => e.convoId === dmAB);
+    const callId = created.callId;
+    ok('caller gets call_created with a call id', typeof callId === 'string' && callId.length > 0);
+    const inviteB = await bob.waitFor('call_invite', (e) => e.callId === callId);
+    ok('callee is rung with caller + convo', inviteB.from === 'Alice' && inviteB.convoId === dmAB);
+
+    // Bob answers: the earlier joiner (Alice) must be the one to offer SDP
+    bob.send({ type: 'call_accept', callId });
+    const joinA = await alice.waitFor('call_join', (e) => e.callId === callId);
+    ok('caller is told to send the offer to the answerer', joinA.isYou === false && joinA.offerTo === 'Bob', JSON.stringify(joinA));
+    const joinB = await bob.waitFor('call_join', (e) => e.callId === callId && e.isYou === true);
+    ok('answerer receives the peers it should expect offers from', Array.isArray(joinB.peers) && joinB.peers.includes('Alice'));
+
+    // SDP + ICE relay
+    alice.send({ type: 'call_signal', callId, to: 'Bob', sdp: { type: 'offer', sdp: 'v=0\r\nfake-sdp' } });
+    const sdpB = await bob.waitFor('call_signal', (e) => e.callId === callId && e.sdp);
+    ok('SDP offer relayed with the sender attached', sdpB.from === 'Alice' && sdpB.sdp.type === 'offer');
+    bob.send({
+      type: 'call_signal', callId, to: 'Alice',
+      candidate: { candidate: 'candidate:1 1 udp 2122 1.2.3.4 5 typ host', sdpMid: '0', sdpMLineIndex: 0 },
+    });
+    const iceA = await alice.waitFor('call_signal', (e) => e.callId === callId && e.candidate);
+    ok('ICE candidate relayed back to the caller', iceA.from === 'Bob' && iceA.candidate.candidate.includes('udp'));
+
+    // outsiders cannot inject signalling, and Bob reads as busy
+    const intruder = new Client('Intruder');
+    await intruder.connect();
+    intruder.send({ type: 'join', name: 'Intruder' });
+    await intruder.waitFor('joined');
+    const signalsBefore = bob.events.length;
+    intruder.send({ type: 'call_signal', callId, to: 'Bob', sdp: { type: 'offer', sdp: 'v=0\r\nintruder' } });
+    await sleep(250);
+    const leaked = bob.events.slice(signalsBefore).filter((e) => e.type === 'call_signal' && e.sdp && e.sdp.sdp.includes('intruder'));
+    ok('non-participants cannot relay signalling into a call', leaked.length === 0);
+    intruder.send({ type: 'call_invite', convoId: 'dm::Bob::Intruder' });
+    const busy = await intruder.waitFor('call_failed', (e) => e.convoId === 'dm::Bob::Intruder');
+    ok('calling someone already on a call reports "busy"', busy.reason === 'busy', JSON.stringify(busy));
+    intruder.close();
+
+    // Bob hangs up → caller notified, call logged in history
+    bob.send({ type: 'call_leave', callId });
+    await alice.waitFor('call_peer_left', (e) => e.callId === callId && e.name === 'Bob');
+    ok('caller sees the peer leave', true);
+    const endedA = await alice.waitFor('call_ended', (e) => e.callId === callId);
+    ok('hang-up ends the call for the remaining side', endedA.reason === 'ended' && endedA.duration >= 0);
+    alice.send({ type: 'history', convoId: dmAB });
+    const afterCall = await alice.waitFor('history', (e) => e.convoId === dmAB && (e.messages || []).some((m) => m.kind === 'call'));
+    const callMsg = afterCall.messages.filter((m) => m.kind === 'call').pop();
+    ok('finished call is logged in history as kind "call"', callMsg.media.status === 'completed' && callMsg.from === 'Alice');
+    ok('call log carries the participants', callMsg.media.members.includes('Bob'));
+
+    // unanswered call → ring timeout (CALL_RING_TIMEOUT_MS=1500 for the test server)
+    const carolBack = new Client('CarolBack');
+    await carolBack.connect();
+    carolBack.send({ type: 'join', name: 'Carol' });
+    await carolBack.waitFor('joined');
+    alice.send({ type: 'call_invite', convoId: 'dm::Alice::Carol' });
+    const created2 = await alice.waitFor('call_created', (e) => e.convoId === 'dm::Alice::Carol');
+    await carolBack.waitFor('call_invite', (e) => e.callId === created2.callId);
+    const timedOut = await alice.waitFor('call_ended', (e) => e.callId === created2.callId, 8000);
+    ok('unanswered call times out for the caller', timedOut.reason === 'timeout');
+    await carolBack.waitFor('call_cancelled', (e) => e.callId === created2.callId, 8000);
+    ok('ringing callee is told the call was cancelled', true);
+    carolBack.send({ type: 'history', convoId: 'dm::Alice::Carol' });
+    const missedH = await carolBack.waitFor('history', (e) => e.convoId === 'dm::Alice::Carol' && (e.messages || []).some((m) => m.kind === 'call'), 8000);
+    const missed = missedH.messages.filter((m) => m.kind === 'call').pop();
+    ok('missed call logged with status "missed" and 0s', missed.media.status === 'missed' && missed.media.duration === 0);
+    carolBack.close();
+
+    // declined call
+    const dora = new Client('Dora');
+    await dora.connect();
+    dora.send({ type: 'join', name: 'Dora' });
+    await dora.waitFor('joined');
+    alice.send({ type: 'call_invite', convoId: 'dm::Alice::Dora' });
+    const created3 = await alice.waitFor('call_created', (e) => e.convoId === 'dm::Alice::Dora');
+    await dora.waitFor('call_invite', (e) => e.callId === created3.callId);
+    dora.send({ type: 'call_reject', callId: created3.callId });
+    const declined = await alice.waitFor('call_ended', (e) => e.callId === created3.callId, 8000);
+    ok('declined call ends for the caller with reason "declined"', declined.reason === 'declined');
+    dora.close();
 
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
