@@ -43,19 +43,29 @@ const state = {
   ws: null,
   connected: false,
   recording: false,
-  incoming: null,       // pending incoming voice/video call invite {callId, convoId, from, callees, kind}
+  incoming: null,
   authenticated: false,
   authToken: null,
   authUsername: null,
-  users: [],            // [{name, online, bot, lastSeen, pic, about}]
-  groups: new Map(),    // grp::<id> -> group
-  rooms: new Map(),     // room::<id> -> room
-  chats: new Map(),     // convoId -> {messages: [], unread: 0, lastTs: 0}
-  active: null,         // active convoId
-  replyTo: null,        // message being replied to (composer quote bar)
-  editing: null,        // {convoId, id} of the message being edited
+  users: [],
+  groups: new Map(),
+  rooms: new Map(),
+  chats: new Map(),
+  active: null,
+  replyTo: null,
+  editing: null,
   lastDateLabel: null,
   privacy: { readReceipts: true, lastSeen: true, typing: true, ghost: false },
+  // new features
+  pinnedChats: [],
+  mutedChats: [],
+  wallpaper: null,
+  disappearing: new Map(), // convoId -> seconds
+  statuses: [], // [{id,from,text,media,ts,expiresAt,views}]
+  filter: 'all', // all | unread | mentions | pinned | starred
+  forwardMsg: null, // message to forward
+  starredCache: new Map(), // convoId -> Set(ids)
+  notifEnabled: false,
 };
 
 const AVATAR_COLORS = ['#00a884', '#0088cc', '#8e44ad', '#e67e22', '#e91e63', '#16a085', '#c0392b', '#2c3e50'];
@@ -337,6 +347,10 @@ function handle(msg) {
     case 'room_created': {
       state.rooms.set(msg.room.id, msg.room);
       closeRoomModal();
+      if (window._pendingRetention && window._pendingRetention>0) {
+        wsSend({ type:'retention_set', convoId: msg.room.id, days: window._pendingRetention });
+        window._pendingRetention=null;
+      }
       showInviteCard(msg.room);
       renderChatList();
       break;
@@ -376,11 +390,20 @@ function handle(msg) {
       if (msg.privacy && typeof msg.privacy === 'object') {
         state.privacy = { ...state.privacy, ...msg.privacy };
       }
+      if (Array.isArray(msg.pinnedChats)) state.pinnedChats = msg.pinnedChats;
+      if (Array.isArray(msg.mutedChats)) state.mutedChats = msg.mutedChats;
+      if (msg.wallpaper) { state.wallpaper = msg.wallpaper; applyWallpaper(msg.wallpaper); }
+      if (msg.statuses) { state.statuses = msg.statuses; renderStatuses(); }
+      if (msg.disappearing) { state.disappearing = new Map(Object.entries(msg.disappearing)); }
       joinScreen.classList.add('hidden');
       app.classList.remove('hidden');
       renderMe();
       syncPrivacyUI();
       renderChatList();
+      renderStatuses();
+      updateDisappearingUI();
+      // request notification permission status
+      if ('Notification' in window && Notification.permission==='granted') state.notifEnabled=true;
       break;
     }
 
@@ -389,6 +412,184 @@ function handle(msg) {
         state.privacy = { ...state.privacy, ...msg.privacy };
       }
       syncPrivacyUI();
+      break;
+    }
+    case 'pinned_update': {
+      state.pinnedChats = msg.pinnedChats || [];
+      renderChatList();
+      break;
+    }
+    case 'muted_update': {
+      if (Array.isArray(msg.mutedChats)) state.mutedChats = msg.mutedChats;
+      else if (msg.convoId) {
+        if (msg.muted) {
+          if (!state.mutedChats.includes(msg.convoId)) state.mutedChats.push(msg.convoId);
+        } else {
+          state.mutedChats = state.mutedChats.filter(c=>c!==msg.convoId);
+        }
+      }
+      renderChatList();
+      updateMuteUI();
+      break;
+    }
+    case 'disappearing_all': {
+      state.disappearing = new Map(Object.entries(msg.timers || {}));
+      updateDisappearingUI();
+      break;
+    }
+    case 'disappearing_update': {
+      if (msg.seconds) state.disappearing.set(msg.convoId, msg.seconds);
+      else state.disappearing.delete(msg.convoId);
+      updateDisappearingUI();
+      break;
+    }
+    case 'message_deleted_for_me': {
+      const chat = getChat(msg.convoId);
+      const m = chat.messages.find(x=>x.id===msg.id);
+      if (m) { if(!m.deletedFor) m.deletedFor=[]; if(!m.deletedFor.includes(state.me)) m.deletedFor.push(state.me); }
+      if (state.active===msg.convoId) renderMessages(chat);
+      renderChatList();
+      break;
+    }
+    case 'chat_cleared': {
+      const chat = getChat(msg.convoId);
+      chat.messages = [];
+      chat.unread = 0;
+      if (state.active===msg.convoId) renderMessages(chat);
+      renderChatList();
+      break;
+    }
+    case 'message_starred': {
+      const chat = getChat(msg.convoId);
+      const m = chat.messages.find(x=>x.id===msg.id);
+      if (m) m.starredBy = msg.starredBy || [];
+      if (state.active===msg.convoId) {
+        const row = messagesEl.querySelector(`[data-msg-id="${msg.id}"]`);
+        if (row) { const cb = row.querySelector('.star-indicator'); if(cb) cb.textContent = (m.starredBy||[]).includes(state.me) ? '⭐' : ''; }
+      }
+      break;
+    }
+    case 'statuses': {
+      state.statuses = msg.statuses || [];
+      renderStatuses();
+      break;
+    }
+    case 'status_created': {
+      state.statuses.push(msg.status);
+      renderStatuses();
+      break;
+    }
+    case 'status_viewed': {
+      const s = state.statuses.find(x=>x.id===msg.statusId);
+      if (s) s.views = msg.views;
+      break;
+    }
+    case 'poll_update': {
+      const chat = getChat(msg.convoId);
+      const m = chat.messages.find(x=>x.id===msg.id);
+      if (m) { m.media = msg.media; patchMessageInDom(chat,m); }
+      break;
+    }
+    case 'mention': {
+      // highlight mention
+      const chat = getChat(msg.convoId);
+      chat.unread = (chat.unread||0)+1;
+      renderChatList();
+      if (!isMuted(msg.convoId)) toast(`💬 ${msg.from} mentioned you`);
+      // per-chat mention indicator via preview
+      if (!isMuted(msg.convoId) && Notification && Notification.permission==='granted' && document.hidden) {
+        try { new Notification(`@${msg.from} mentioned you`, { body: 'in '+msg.convoId, icon: '/avatars/aria.svg' }); } catch {}
+      }
+      break;
+    }
+    case 'reaction': {
+      const chat = getChat(msg.convoId);
+      const m = chat.messages.find((x) => x.id === msg.id);
+      if (m) {
+        m.reactions = msg.reactions || {};
+        if (state.active === msg.convoId) {
+          renderReactionsOnBubble(m);
+        }
+        renderChatList();
+        if (msg.reactor && msg.reactor!==state.me) toast(`${msg.reactor} reacted with ${msg.emoji}`);
+      }
+      break;
+    }
+    case 'read_state': {
+      // per-chat read state updated
+      break;
+    }
+    case 'wallpaper_saved': {
+      state.wallpaper = msg.wallpaper;
+      applyWallpaper(state.wallpaper);
+      break;
+    }
+    case '2fa_secret': {
+      $('twoFASecret').textContent = msg.secret;
+      $('twoFAStatus').textContent = 'Scan or copy secret, then verify';
+      $('twoFASecretWrap').classList.remove('hidden');
+      break;
+    }
+    case '2fa_enabled': {
+      $('twoFAStatus').textContent = '✅ 2FA enabled';
+      $('twoFASecretWrap').classList.add('hidden');
+      $('enable2FABtn').classList.add('hidden');
+      $('disable2FABtn').classList.remove('hidden');
+      toast('2FA enabled 🔐');
+      break;
+    }
+    case '2fa_disabled': {
+      $('twoFAStatus').textContent = '2FA disabled';
+      $('enable2FABtn').classList.remove('hidden');
+      $('disable2FABtn').classList.add('hidden');
+      break;
+    }
+    case '2fa_error': {
+      toast(msg.error || '2FA error');
+      break;
+    }
+    case 'push_subscribed': {
+      state.notifEnabled = true;
+      toast('🔔 Notifications enabled');
+      break;
+    }
+    case 'push_unsubscribed': {
+      state.notifEnabled = false;
+      toast('Notifications disabled');
+      break;
+    }
+    case 'reset_token': {
+      $('resetTokenDisplay').textContent = 'Token: '+msg.token+' (demo: copy it)';
+      $('resetTokenDisplay').classList.remove('hidden');
+      $('resetTokenInput').classList.remove('hidden');
+      $('resetNewPw').classList.remove('hidden');
+      $('doResetBtn').classList.remove('hidden');
+      $('resetTokenInput').value = msg.token;
+      break;
+    }
+    case 'reset_ok': {
+      toast('Password reset! Now log in');
+      $('resetTokenDisplay').classList.add('hidden');
+      break;
+    }
+    case 'reset_error': {
+      toast(msg.error || 'Reset failed');
+      break;
+    }
+    case 'auth_2fa_required': {
+      $('authOtp').classList.remove('hidden');
+      $('authError').textContent = '2FA code required';
+      $('authError').classList.remove('hidden');
+      break;
+    }
+    case 'search_results': {
+      renderSearchResults(msg.query, msg.results || []);
+      break;
+    }
+    case 'account_deleted': {
+      toast('Account deleted');
+      localStorage.clear();
+      location.reload();
       break;
     }
 
@@ -443,8 +644,10 @@ function handle(msg) {
         chat.unread++;
       }
 
-      if (m.from === state.me) pop(520);
-      else if (m.convoId !== state.active || !document.hasFocus()) pop(880);
+      if (!isMuted(m.convoId)) {
+        if (m.from === state.me) pop(520);
+        else if (m.convoId !== state.active || !document.hasFocus()) pop(880);
+      }
 
       renderChatList();
       updateTitleBadge();
@@ -628,20 +831,7 @@ function handle(msg) {
       break;
     }
 
-    case 'reaction': {
-      const chat = getChat(msg.convoId);
-      const m = chat.messages.find((x) => x.id === msg.id);
-      if (m) {
-        m.reactions = msg.reactions || {};
-        if (state.active === msg.convoId) {
-          renderReactionsOnBubble(m);
-        }
-        renderChatList();
-      }
-      break;
-    }
-
-    case 'message_edited': {
+        case 'message_edited': {
       const chat = getChat(msg.convoId);
       const m = chat.messages.find((x) => x.id === msg.id);
       if (m) {
@@ -690,15 +880,42 @@ function listEntries() {
   for (const r of state.rooms.values()) {
     entries.push({ id: r.id, title: r.name, pic: null, room: r, chat: getChat(r.id), kind: 'room' });
   }
-  return entries.sort((a, b) => (b.chat.lastTs - a.chat.lastTs) || a.title.localeCompare(b.title));
+  // pinned sorting + keep unread pinned first
+  const pinnedSet = new Set(state.pinnedChats || []);
+  return entries.sort((a, b) => {
+    const aPinned = pinnedSet.has(a.id) ? 0 : 1;
+    const bPinned = pinnedSet.has(b.id) ? 0 : 1;
+    if (aPinned !== bPinned) return aPinned - bPinned;
+    return (b.chat.lastTs - a.chat.lastTs) || a.title.localeCompare(b.title);
+  });
 }
+function hasMention(convoId) {
+  const chat = getChat(convoId);
+  return chat.messages.some(m => (m.mentions||[]).includes(state.me) && !(m.readBy||[]).includes(state.me));
+}
+function hasStarred(convoId) {
+  const chat = getChat(convoId);
+  return chat.messages.some(m => (m.starredBy||[]).includes(state.me));
+}
+function isMuted(convoId) {
+  return (state.mutedChats||[]).includes(convoId);
+}
+
 
 function previewText(m) {
   if (m.deleted) return '🚫 This message was deleted';
+  if (m.forwarded) return '↗️ Forwarded: ' + (m.text || previewText({...m, forwarded:false}) );
   if (m.kind === 'photo') return '📸 Photo' + (m.text ? `: ${m.text}` : '');
   if (m.kind === 'voice') return '🎙️ Voice message';
+  if (m.kind === 'sticker') return '🎭 Sticker';
+  if (m.kind === 'gif') return '🎞️ GIF';
+  if (m.kind === 'poll') return '📊 Poll: ' + (m.media && m.media.question || '');
   if (m.kind === 'call') return callPreview(m);
-  return m.text;
+  // per-chat read state indicator hint
+  let p = m.text;
+  if ((m.starredBy||[]).includes(state.me)) p = '⭐ '+p;
+  if (m.expiresAt) p = '⏳ '+p;
+  return p;
 }
 
 // "📞 Voice call · 1:23" / "🎥 Video call · 0:42" / "❌ Missed video call" —
@@ -725,16 +942,21 @@ function callPreview(m) {
 
 function renderChatList() {
   const filter = searchInput.value.trim().toLowerCase();
+  const chipFilter = state.filter || 'all';
   chatListEl.innerHTML = '';
   let any = false;
 
   for (const c of listEntries()) {
-    if (filter && !c.title.toLowerCase().includes(filter)) continue;
+    if (filter && !c.title.toLowerCase().includes(filter) && !previewText(c.chat.messages[c.chat.messages.length-1]||{text:''}).toLowerCase().includes(filter)) continue;
+    if (chipFilter==='unread' && !c.chat.unread) continue;
+    if (chipFilter==='mentions' && !hasMention(c.id)) continue;
+    if (chipFilter==='pinned' && !(state.pinnedChats||[]).includes(c.id)) continue;
+    if (chipFilter==='starred' && !hasStarred(c.id)) continue;
     any = true;
     const isGroup = !!c.group;
     const isRoom = !!c.room;
     const item = document.createElement('div');
-    item.className = 'chat-item' + (c.id === state.active ? ' active' : '');
+    item.className = 'chat-item' + (c.id === state.active ? ' active' : '') + (isMuted(c.id) ? ' muted' : '');
     item.addEventListener('click', () => openChat(c.id));
 
     const av = document.createElement('div');
@@ -765,6 +987,27 @@ function renderChatList() {
     }
     const timeEl = document.createElement('span');
     timeEl.className = 'ci-time' + (c.chat.unread ? ' unread' : '');
+    if ((state.pinnedChats||[]).includes(c.id)) {
+      const pin = document.createElement('span');
+      pin.textContent = ' 📌';
+      pin.style.fontSize='11px';
+      nameEl.appendChild(pin);
+    }
+    if (isMuted(c.id)) {
+      const muted = document.createElement('span');
+      muted.textContent = ' 🔇';
+      muted.style.fontSize='11px';
+      muted.title = 'Muted';
+      nameEl.appendChild(muted);
+    }
+    if (hasMention(c.id)) {
+      const mt = document.createElement('span');
+      mt.className = 'bot-tag';
+      mt.style.borderColor = '#e91e63';
+      mt.style.color = '#e91e63';
+      mt.textContent = '@';
+      nameEl.appendChild(mt);
+    }
     if (c.chat.lastTs) timeEl.textContent = listTime(c.chat.lastTs);
     top.append(nameEl, timeEl);
 
@@ -846,6 +1089,8 @@ function openChat(convoId) {
 
   renderChatList();
   updateTitleBadge();
+  updateDisappearingUI();
+  updateMuteUI();
   msgInput.focus();
 }
 
@@ -1121,19 +1366,36 @@ function buildBubble(m, prev) {
 
   if (m.replyTo) bubble.appendChild(buildQuoteEl(m));
 
-  if (m.kind === 'photo' && m.media) {
+  if (m.forwarded) {
+    const fwdLabel = document.createElement('div');
+    fwdLabel.className = 'forward-label';
+    fwdLabel.textContent = '↗️ Forwarded' + (m.forwardedFrom ? ' from '+m.forwardedFrom : '');
+    bubble.appendChild(fwdLabel);
+  }
+  if ((m.kind === 'photo' || m.kind === 'sticker' || m.kind === 'gif') && m.media) {
     bubble.classList.add('photo-bubble');
     const img = document.createElement('img');
-    img.className = 'photo-img';
+    img.className = m.kind==='sticker' ? 'sticker-img' : 'photo-img';
     img.src = m.media.url;
-    img.alt = m.media.name || 'Photo';
+    img.alt = m.media.name || m.kind;
     img.addEventListener('click', () => openLightbox(m.media.url));
     bubble.appendChild(img);
+  }
+  if (m.kind === 'sticker' && !m.media && m.text) {
+    const st = document.createElement('div');
+    st.className = 'sticker-text';
+    st.textContent = m.text;
+    st.style.fontSize = '48px';
+    st.style.lineHeight = '1';
+    bubble.appendChild(st);
   }
 
   if (m.kind === 'voice' && m.media) {
     bubble.classList.add('voice-bubble');
     bubble.appendChild(buildVoicePlayer(m));
+  }
+  if (m.kind === 'poll' && m.media) {
+    bubble.appendChild(buildPollEl(m));
   }
 
   if (m.kind === 'call') {
@@ -1159,8 +1421,15 @@ function buildBubble(m, prev) {
 
   const metaEl = buildMetaEl(m, out);
 
+  // highlight @mentions
+  if (m.text && m.text.includes('@')) {
+    // will be handled in text rendering below via innerHTML with highlight
+  }
   if (m.text) {
-    if (m.kind === 'photo') {
+    if (m.kind === 'sticker' && !m.media) {
+      // already rendered sticker text big, just add meta
+      bubble.appendChild(metaEl);
+    } else if (m.kind === 'photo' || m.kind === 'sticker' || m.kind === 'gif') {
       // caption under the photo, time floats right of the caption line
       const capWrap = document.createElement('span');
       capWrap.className = 'caption-wrap';
@@ -1172,7 +1441,20 @@ function buildBubble(m, prev) {
       bubble.appendChild(capWrap);
     } else {
       const text = document.createElement('span');
-      text.textContent = m.text;
+      // highlight mentions
+      if (m.text.includes('@'+state.me)) {
+        text.innerHTML = m.text.replace(new RegExp('@'+state.me.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '<b style="color:var(--accent)">@'+state.me+'</b>');
+      } else {
+        text.textContent = m.text;
+      }
+      // starred indicator
+      if ((m.starredBy||[]).includes(state.me)) {
+        const star = document.createElement('span');
+        star.className = 'star-indicator';
+        star.textContent = ' ⭐';
+        star.style.fontSize='12px';
+        text.appendChild(star);
+      }
       bubble.appendChild(text);
       bubble.appendChild(metaEl);
     }
@@ -1323,8 +1605,14 @@ function openReactionPicker(m, anchorEl) {
     actions.appendChild(btn);
   };
   addAction('↩️', 'Reply', () => startReply(m));
-  if (m.from === state.me && (m.kind === 'text' || m.kind === 'photo')) addAction('✏️', 'Edit', () => startEdit(m));
+  addAction('↗️', 'Forward', () => openForwardPicker(m));
+  addAction((m.starredBy||[]).includes(state.me) ? '⭐' : '☆', (m.starredBy||[]).includes(state.me) ? 'Unstar' : 'Star', () => toggleStar(m));
+  if (m.from === state.me && (m.kind === 'text' || m.kind === 'photo' || m.kind === 'poll')) addAction('✏️', 'Edit', () => startEdit(m));
   if (m.from === state.me) addAction('🗑️', 'Delete', () => deleteMessage(m));
+  if (m.from === state.me) addAction('🗑️', 'Delete for me', () => deleteForMe(m));
+  else addAction('🗑️', 'Delete for me', () => deleteForMe(m));
+  if (m.editHistory && m.editHistory.length) addAction('🕓', 'History', () => showEditHistory(m));
+  // reacted with text handled via toast in reaction handler
   picker.appendChild(actions);
 
   document.body.appendChild(picker);
@@ -2653,7 +2941,30 @@ function openChatInfo() {
     const onB = ub && ub.online ? 0 : 1;
     return (onA - onB) || a.localeCompare(b);
   });
-  for (const n of sorted) chatInfoMembers.appendChild(infoMemberRow(n, creator));
+  for (const n of sorted) {
+    const row = infoMemberRow(n, creator);
+    // admin remove button
+    if (isGroupAdmin(state.active, state.me) && n !== state.me && n !== creator) {
+      const rmBtn = document.createElement('button');
+      rmBtn.className = 'btn';
+      rmBtn.style.padding = '2px 8px';
+      rmBtn.style.fontSize = '11px';
+      rmBtn.textContent = 'Remove';
+      rmBtn.addEventListener('click', (e)=>{ e.stopPropagation(); if(confirm('Remove '+n+'?')) wsSend({ type:'group_remove_member', groupId: state.active, member:n }); });
+      row.appendChild(rmBtn);
+      const makeBtn = document.createElement('button');
+      makeBtn.className = 'btn';
+      makeBtn.style.padding = '2px 8px';
+      makeBtn.style.fontSize = '11px';
+      makeBtn.textContent = 'Make admin';
+      makeBtn.addEventListener('click', (e)=>{ e.stopPropagation(); wsSend({ type:'group_make_admin', groupId: state.active, member:n }); });
+      if (!(meta.group && meta.group.admins && meta.group.admins.includes(n))) row.appendChild(makeBtn);
+    }
+    chatInfoMembers.appendChild(row);
+  }
+  // show admin actions if admin
+  const adminWrap = document.getElementById('adminActions');
+  if (adminWrap) adminWrap.classList.toggle('hidden', !isGroupAdmin(state.active, state.me));
 
   chatInfoModal.classList.remove('hidden');
 }
@@ -2676,8 +2987,30 @@ chatInfoCopyBtn.addEventListener('click', async () => {
 
 /* ------------------------------ emoji panel -------------------------------- */
 
+const STICKERS = ['😺','🐶','🦊','🐼','🦁','🐯','🐨','🐸','🦄','🐙','🦋','🍕','🍔','🍟','🌮','🍩','⚽','🎮','🚀','💎'];
+const GIFS = [
+  { url: 'https://media.giphy.com/media/3o7TKSjRrfIPjeiVyM/giphy.gif', tags: ['happy','dance'] },
+  { url: 'https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif', tags: ['lol','funny'] },
+  { url: 'https://media.giphy.com/media/26BRuo6sLetdllPAQ/giphy.gif', tags: ['love','heart'] },
+  { url: 'https://media.giphy.com/media/3o6Zt481isNVuQI1l6/giphy.gif', tags: ['wow','omg'] },
+  { url: 'https://media.giphy.com/media/xT5LMHxhOfscxPfIfm/giphy.gif', tags: ['sad','cry'] },
+  { url: 'https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif', tags: ['cool','sunglasses'] },
+  { url: 'https://media.giphy.com/media/l0HlBO7eyXzSZkJri/giphy.gif', tags: ['clap','bravo'] },
+  { url: 'https://media.giphy.com/media/26gssIytJBS1EL6Ls/giphy.gif', tags: ['party','celebrate'] },
+];
+const WALLPAPERS = [
+  { id: 'default', label: 'Default', css: '' },
+  { id: 'mint', label: 'Mint', css: '#e0f2e9' },
+  { id: 'peach', label: 'Peach', css: '#fff3e0' },
+  { id: 'lavender', label: 'Lavender', css: '#f3e5f5' },
+  { id: 'sky', label: 'Sky', css: '#e3f2fd' },
+  { id: 'dark', label: 'Dark', css: '#1a1a1a' },
+  { id: 'doodle', label: 'Doodle', css: 'var(--chat-bg)' },
+];
+
 const EMOJIS = ['😀','😂','🤣','😊','😍','😘','😎','🤔','😅','😭','😡','🥺','😴','🤯','😇','🙃','😉','🤗','🤫','🤭','👍','👎','👌','✌️','🙏','👏','🙌','🤝','💪','🫶','❤️','💔','💯','🔥','✨','🎉','🎂','🎁','🎧','🎵','🎶','⚽','🏆','🌙','☀️','🌈','⭐','🍕'];
 
+const emojiTabContentEl = document.getElementById('emojiTabContent');
 for (const emo of EMOJIS) {
   const b = document.createElement('button');
   b.textContent = emo;
@@ -2688,7 +3021,7 @@ for (const emo of EMOJIS) {
     msgInput.focus();
     msgInput.selectionStart = msgInput.selectionEnd = start + emo.length;
   });
-  emojiPanel.appendChild(b);
+  (emojiTabContentEl || emojiPanel).appendChild(b);
 }
 
 emojiBtn.addEventListener('click', (e) => {
@@ -2847,10 +3180,13 @@ function closeRoomModal() {
 roomCreateBtn.addEventListener('click', () => {
   const name = roomNameInput.value.trim();
   const password = roomPasswordInput.value;
+  const retention = parseInt($('roomRetentionInput')?.value || '0', 10) || 0;
   if (!name) { toast('Please enter a room name'); roomNameInput.focus(); return; }
   if (!password || password.length < 3) { toast('Password must be at least 3 characters'); roomPasswordInput.focus(); return; }
   roomCreateBtn.disabled = true;
   wsSend({ type: 'room_create', name, password });
+  // retention set after creation via separate message? For now store and send after room_created handles retention
+  window._pendingRetention = retention;
   setTimeout(() => { roomCreateBtn.disabled = false; }, 3000);
 });
 
@@ -2954,7 +3290,18 @@ document.addEventListener('keydown', (e) => {
     closeChatInfo();
     closeAddToCallModal();
     closePrivacyModal();
-    cancelMessageAction(false); // cancel a pending reply / edit
+    cancelMessageAction(false);
+    $('disappearingModal')?.classList.add('hidden');
+    $('forwardModal')?.classList.add('hidden');
+    $('pollModal')?.classList.add('hidden');
+    $('statusCreateModal')?.classList.add('hidden');
+    $('statusViewer')?.classList.add('hidden');
+    $('wallpaperModal')?.classList.add('hidden');
+    $('starredModal')?.classList.add('hidden');
+    $('accountModal')?.classList.add('hidden');
+    $('addMemberModal')?.classList.add('hidden');
+    $('chatSearchBar')?.classList.add('hidden');
+    $('searchResults')?.classList.add('hidden');
   }
 });
 
@@ -2977,4 +3324,533 @@ if (storedToken && storedName) {
   authUsernameInput.focus();
 }
 
+
+/* ==================== new feature helpers ==================== */
+
+function buildPollEl(m) {
+  const wrap = document.createElement('div');
+  wrap.className = 'poll-wrap';
+  const q = document.createElement('div');
+  q.className = 'poll-question';
+  q.textContent = m.media.question;
+  wrap.appendChild(q);
+  const total = m.media.options.reduce((s,o)=>s+o.votes.length,0) || 1;
+  m.media.options.forEach((opt, idx) => {
+    const row = document.createElement('div');
+    row.className = 'poll-option';
+    const btn = document.createElement('button');
+    btn.className = 'poll-vote-btn';
+    btn.textContent = opt.text;
+    if (opt.votes.includes(state.me)) btn.classList.add('voted');
+    if (m.media.closed) btn.disabled = true;
+    btn.addEventListener('click', () => wsSend({ type: 'poll_vote', convoId: m.convoId, id: m.id, optionIndex: idx }));
+    const bar = document.createElement('div');
+    bar.className = 'poll-bar';
+    const fill = document.createElement('div');
+    fill.className = 'poll-fill';
+    fill.style.width = Math.round((opt.votes.length/total)*100)+'%';
+    bar.appendChild(fill);
+    const count = document.createElement('span');
+    count.className = 'poll-count';
+    count.textContent = opt.votes.length + ' vote' + (opt.votes.length!==1?'s':'');
+    if (opt.votes.includes(state.me)) count.textContent += ' • you';
+    row.append(btn, bar, count);
+    wrap.appendChild(row);
+  });
+  if (!m.media.closed && (m.from===state.me || isGroupAdmin(m.convoId, state.me))) {
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'btn';
+    closeBtn.textContent = 'Close poll';
+    closeBtn.style.marginTop='8px';
+    closeBtn.addEventListener('click', ()=>wsSend({type:'poll_close', convoId:m.convoId, id:m.id}));
+    wrap.appendChild(closeBtn);
+  }
+  if (m.media.closed) {
+    const closed = document.createElement('div');
+    closed.className = 'poll-closed';
+    closed.textContent = 'Poll closed';
+    wrap.appendChild(closed);
+  }
+  return wrap;
+}
+function isGroupAdmin(convoId, name) {
+  if (convoId.startsWith('grp::')) {
+    const g = state.groups.get(convoId);
+    if (!g) return false;
+    return g.createdBy===name || (g.admins||[]).includes(name);
+  }
+  if (convoId.startsWith('room::')) {
+    const r = state.rooms.get(convoId);
+    return r && r.createdBy===name;
+  }
+  return false;
+}
+function toggleStar(m) {
+  const starred = !(m.starredBy||[]).includes(state.me);
+  wsSend({ type: 'star_message', convoId: m.convoId, id: m.id, starred });
+}
+function deleteForMe(m) {
+  if (!confirm('Delete this message for you only?')) return;
+  wsSend({ type: 'delete_for_me', convoId: m.convoId, id: m.id });
+}
+function showEditHistory(m) {
+  const hist = m.editHistory || [];
+  if (!hist.length) { toast('No edit history'); return; }
+  alert('Edit history:\n' + hist.map(h=> new Date(h.at||h.ts).toLocaleString() + ': ' + h.text).join('\n') + '\n\nCurrent: ' + m.text);
+}
+let forwardPending = null;
+function openForwardPicker(m) {
+  forwardPending = m;
+  const list = $('forwardList');
+  list.innerHTML = '';
+  for (const c of listEntries()) {
+    const row = document.createElement('label');
+    row.className = 'gm-member';
+    const cb = document.createElement('input');
+    cb.type='checkbox'; cb.value=c.id;
+    const av = document.createElement('div');
+    av.className='avatar'; applyAvatar(av, c.title, c.pic, c.kind==='group'?'👥': c.kind==='room'?'🔒':undefined);
+    const nameEl = document.createElement('span'); nameEl.textContent=c.title;
+    row.append(cb, av, nameEl);
+    list.appendChild(row);
+  }
+  $('forwardModal').classList.remove('hidden');
+}
+function closeForwardPicker() { $('forwardModal').classList.add('hidden'); forwardPending=null; }
+function doForward() {
+  if (!forwardPending) return;
+  const ids = [...$('forwardList').querySelectorAll('input:checked')].map(cb=>cb.value);
+  if (!ids.length) { toast('Pick at least one chat'); return; }
+  wsSend({ type: 'forward', messageId: forwardPending.id, fromConvoId: forwardPending.convoId, toConvoIds: ids });
+  toast('Forwarded ↗️');
+  closeForwardPicker();
+}
+function updateDisappearingUI() {
+  const sec = state.active ? (state.disappearing.get(state.active)||0) : 0;
+  const btn = $('disappearingBtn');
+  if (btn) {
+    btn.textContent = sec ? '⏳'+ (sec<60? sec+'s' : sec<3600? Math.floor(sec/60)+'m' : Math.floor(sec/3600)+'h') : '⏳';
+    btn.classList.toggle('active', !!sec);
+  }
+}
+function openDisappearingModal() {
+  if (!state.active) return;
+  const sec = state.disappearing.get(state.active)||0;
+  document.querySelectorAll('input[name="disappearing"]').forEach(r=> r.checked = Number(r.value)===sec);
+  $('disappearingModal').classList.remove('hidden');
+}
+function saveDisappearing() {
+  const sel = document.querySelector('input[name="disappearing"]:checked');
+  const sec = sel ? Number(sel.value) : 0;
+  wsSend({ type: 'disappearing_set', convoId: state.active, seconds: sec });
+  $('disappearingModal').classList.add('hidden');
+  toast(sec ? `⏳ Disappearing: ${sec}s` : 'Disappearing off');
+}
+function applyWallpaper(wp) {
+  state.wallpaper = wp;
+  const msgs = document.getElementById('messages');
+  if (!msgs) return;
+  if (!wp || wp==='default' || !wp) {
+    msgs.style.background = '';
+    msgs.style.backgroundColor = '';
+    localStorage.setItem('achat-wallpaper','default');
+    return;
+  }
+  const found = WALLPAPERS.find(w=>w.id===wp || w.css===wp);
+  const css = found ? found.css : wp;
+  if (css.startsWith('#') || css.startsWith('rgb')) msgs.style.backgroundColor = css;
+  else msgs.style.background = css;
+  msgs.style.backgroundImage = 'var(--doodle)';
+  localStorage.setItem('achat-wallpaper', wp);
+}
+function renderWallpapers() {
+  const grid = $('wallpaperGrid');
+  if (!grid) return;
+  grid.innerHTML='';
+  for (const w of WALLPAPERS) {
+    const btn = document.createElement('button');
+    btn.className='wallpaper-swatch';
+    btn.title=w.label;
+    if (w.css && w.css.startsWith('#')) btn.style.background = w.css;
+    else if (w.id==='default') btn.style.background='var(--chat-bg)';
+    else if (w.id==='doodle') btn.style.background='var(--panel-header)';
+    const lbl = document.createElement('span'); lbl.textContent=w.label;
+    btn.append(lbl);
+    btn.addEventListener('click', ()=>{
+      const val = w.id==='default' ? '' : w.css || w.id;
+      wsSend({ type: 'wallpaper_set', wallpaper: val });
+      applyWallpaper(val || 'default');
+      toast('Wallpaper: '+w.label);
+    });
+    grid.appendChild(btn);
+  }
+}
+function renderStatuses() {
+  const list = $('statusList');
+  if (!list) return;
+  list.innerHTML='';
+  // group by user
+  const byUser = new Map();
+  for (const s of state.statuses) {
+    if (!byUser.has(s.from)) byUser.set(s.from, []);
+    byUser.get(s.from).push(s);
+  }
+  for (const [user, arr] of byUser) {
+    const u = findUser(user);
+    const item = document.createElement('div');
+    item.className='status-item';
+    const av = document.createElement('div');
+    av.className='status-avatar';
+    applyAvatar(av, user, u?u.pic:null);
+    if (arr.some(s=>!(s.views||[]).includes(state.me)) && user!==state.me) av.classList.add('unseen');
+    const name = document.createElement('span');
+    name.className='status-name';
+    name.textContent=user;
+    item.append(av, name);
+    item.addEventListener('click', ()=>openStatusViewer(user));
+    list.appendChild(item);
+  }
+}
+function openStatusViewer(user) {
+  const arr = state.statuses.filter(s=>s.from===user).sort((a,b)=>b.ts-a.ts);
+  if (!arr.length) return;
+  const s = arr[0];
+  $('statusViewerAvatar').textContent = initialOf(user);
+  applyAvatar($('statusViewerAvatar'), user, findUser(user)?.pic);
+  $('statusViewerName').textContent=user;
+  $('statusViewerTime').textContent=new Date(s.ts).toLocaleString();
+  const body = $('statusViewerBody');
+  body.innerHTML='';
+  if (s.media && s.media.url) {
+    const img=document.createElement('img'); img.src=s.media.url; img.style.maxWidth='100%'; body.appendChild(img);
+  }
+  if (s.text) {
+    const p=document.createElement('p'); p.textContent=s.text; p.style.marginTop='12px'; body.appendChild(p);
+  }
+  $('statusViewerViews').textContent = (s.views||[]).length + ' views';
+  $('statusViewer').classList.remove('hidden');
+  if (user!==state.me) wsSend({ type: 'status_view', statusId: s.id });
+}
+function closeStatusViewer(){ $('statusViewer').classList.add('hidden'); }
+function openStatusCreate(){ $('statusCreateModal').classList.remove('hidden'); }
+function closeStatusCreate(){ $('statusCreateModal').classList.add('hidden'); $('statusText').value=''; $('statusPhotoName').textContent=''; }
+function sendStatus(){
+  const text=$('statusText').value.trim();
+  let media=null;
+  if (window._statusDataUrl) media={ url: window._statusUrl || '', name: 'status.jpg' };
+  // if we have uploaded url, send as photo inside status
+  if (!text && !media) { toast('Add text or photo'); return; }
+  // if we have pending dataUrl but not yet uploaded, upload first
+  if (window._statusDataUrl && !window._statusUrl) {
+    uploadDataUrl(window._statusDataUrl, 'status.jpg').then(url=>{
+      window._statusUrl=url;
+      wsSend({ type:'status_create', text, media:{url}, kind:'photo' });
+      closeStatusCreate();
+    }).catch(e=>toast(e.message));
+    return;
+  }
+  wsSend({ type:'status_create', text, media, kind: media?'photo':'text' });
+  closeStatusCreate();
+}
+function renderSearchResults(q, results){
+  const el=$('searchResults');
+  if (!el) return;
+  if (!q) { el.classList.add('hidden'); return; }
+  el.innerHTML='';
+  el.classList.remove('hidden');
+  const head=document.createElement('div'); head.className='gm-label'; head.textContent=`${results.length} results for "${q}"`; el.appendChild(head);
+  for (const r of results.slice(0,20)) {
+    const row=document.createElement('div');
+    row.className='search-result';
+    row.innerHTML=`<b>${r.convoId}</b>: ${r.message.text.slice(0,80)}`;
+    row.addEventListener('click', ()=>{ openChat(r.convoId); el.classList.add('hidden'); });
+    el.appendChild(row);
+  }
+  if (!results.length) el.innerHTML='<div class="list-note">No matches</div>';
+}
+function doGlobalSearch(){
+  const q=$('searchInput').value.trim();
+  if (q.length<2) { $('searchResults').classList.add('hidden'); renderChatList(); return; }
+  // local filter already applied via renderChatList, also server search
+  wsSend({ type:'search_messages', query: q });
+}
+function doChatSearch(){
+  const q=$('chatSearchInput').value.trim().toLowerCase();
+  const chat=getChat(state.active);
+  if (!chat) return;
+  messagesEl.innerHTML='';
+  state.lastDateLabel=null;
+  let prev=null;
+  for (const m of chat.messages) {
+    if (q && !(m.text||'').toLowerCase().includes(q)) continue;
+    const label=dateLabel(m.ts);
+    if (label!==state.lastDateLabel){ messagesEl.appendChild(daySep(label)); state.lastDateLabel=label; prev=null; }
+    messagesEl.appendChild(buildBubble(m, prev));
+    prev=m;
+  }
+}
+function togglePinChat(){
+  if (!state.active) return;
+  const isPinned=(state.pinnedChats||[]).includes(state.active);
+  wsSend({ type:'pin_chat', convoId: state.active, pinned: !isPinned });
+  toast(isPinned? 'Unpinned 📌':'Pinned 📌');
+}
+function updateMuteUI(){
+  const btn=$('muteChatBtn');
+  if (!btn || !state.active) return;
+  const muted=isMuted(state.active);
+  btn.textContent = muted ? '🔇' : '🔔';
+  btn.title = muted ? 'Unmute notifications' : 'Mute notifications';
+  btn.classList.toggle('active', muted);
+}
+function toggleMuteChat(){
+  if (!state.active) return;
+  const muted=isMuted(state.active);
+  wsSend({ type:'mute_set', convoId: state.active, muted: !muted });
+  toast(!muted ? '🔇 Muted — notifications off for this chat' : '🔔 Unmuted');
+  // optimistic update
+  if (!muted) {
+    if (!state.mutedChats.includes(state.active)) state.mutedChats.push(state.active);
+  } else {
+    state.mutedChats = state.mutedChats.filter(c=>c!==state.active);
+  }
+  renderChatList();
+  updateMuteUI();
+}
+function clearChat(){
+  if (!state.active) return;
+  if (!confirm('Clear chat for you only? This hides all messages.')) return;
+  wsSend({ type:'clear_chat', convoId: state.active });
+}
+function openPollModal(){ if(!state.active) return; $('pollModal').classList.remove('hidden'); }
+function closePollModal(){ $('pollModal').classList.add('hidden'); }
+function createPoll(){
+  const q=$('pollQuestion').value.trim();
+  const opts=[...document.querySelectorAll('.poll-opt')].map(i=>i.value.trim()).filter(Boolean);
+  if (!q || opts.length<2) { toast('Add question + at least 2 options'); return; }
+  const multiple=$('pollMultiple').checked;
+  wsSend({ type:'message', convoId: state.active, kind:'poll', text: q, media: { question:q, options: opts, multiple } });
+  closePollModal();
+  $('pollQuestion').value=''; document.querySelectorAll('.poll-opt').forEach(i=>i.value='');
+}
+function setupGifStickers(){
+  // GIF search
+  const gifSearch=$('gifSearch');
+  const gifGrid=$('gifGrid');
+  function renderGifs(filter=''){
+    gifGrid.innerHTML='';
+    const f=filter.toLowerCase();
+    for (const g of GIFS) {
+      if (f && !g.tags.some(t=>t.includes(f)) && !g.url.includes(f)) continue;
+      const img=document.createElement('img');
+      img.src=g.url; img.className='gif-thumb';
+      img.addEventListener('click', ()=>{
+        wsSend({ type:'message', convoId: state.active, kind:'gif', text:'', media:{ url:g.url } });
+        $('emojiPanel').classList.add('hidden');
+      });
+      gifGrid.appendChild(img);
+    }
+  }
+  if(gifSearch) gifSearch.addEventListener('input', ()=>renderGifs(gifSearch.value));
+  renderGifs();
+  // Stickers
+  const stickerGrid=$('stickerGrid');
+  if (stickerGrid) {
+    stickerGrid.innerHTML='';
+    for (const s of STICKERS) {
+      const btn=document.createElement('button');
+      btn.className='sticker-btn';
+      btn.textContent=s;
+      btn.style.fontSize='32px';
+      btn.addEventListener('click', ()=>{
+        wsSend({ type:'message', convoId: state.active, kind:'sticker', text:s, media:null });
+        $('emojiPanel').classList.add('hidden');
+      });
+      stickerGrid.appendChild(btn);
+    }
+  }
+}
+function enableNotifications(){
+  if (!('Notification' in window)) { toast('Notifications not supported'); return; }
+  Notification.requestPermission().then(perm=>{
+    if (perm==='granted') {
+      state.notifEnabled=true;
+      toast('🔔 Notifications enabled');
+      // register push
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').then(reg=>{
+          return reg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey: urlBase64ToUint8Array('BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U') });
+        }).then(sub=>{
+          wsSend({ type:'push_subscribe', subscription: sub });
+        }).catch(()=>{});
+      }
+    } else { toast('Permission denied'); }
+  });
+}
+function urlBase64ToUint8Array(base64String){
+  const padding='='.repeat((4-base64String.length%4)%4);
+  const base64=(base64String+padding).replace(/-/g,'+').replace(/_/g,'/');
+  const rawData=window.atob(base64);
+  const outputArray=new Uint8Array(rawData.length);
+  for(let i=0;i<rawData.length;++i) outputArray[i]=rawData.charCodeAt(i);
+  return outputArray;
+}
+function exportData(){
+  fetch('/api/export/'+encodeURIComponent(state.me)).then(r=>r.json()).then(j=>{
+    if (!j.ok) return toast('Export failed');
+    const blob=new Blob([JSON.stringify(j.data,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download=`a-chat-${state.me}-${Date.now()}.json`; a.click(); URL.revokeObjectURL(url);
+    toast('Export downloaded 📥');
+  });
+}
+function openAccountModal(){
+  $('accountModal').classList.remove('hidden');
+  // fetch 2FA status from profile
+  const p = profiles.get(state.me) || {};
+  const twoFA = p.twoFA || state.privacy.twoFA;
+  $('twoFAStatus').textContent = (p.twoFA && p.twoFA.enabled) ? '✅ 2FA enabled' : '2FA not enabled';
+  if (p.twoFA && p.twoFA.enabled) { $('enable2FABtn').classList.add('hidden'); $('disable2FABtn').classList.remove('hidden'); }
+  else { $('enable2FABtn').classList.remove('hidden'); $('disable2FABtn').classList.add('hidden'); }
+}
+
 connect();
+// wallpaper init
+renderWallpapers();
+setupGifStickers();
+applyWallpaper(localStorage.getItem('achat-wallpaper') || 'default');
+
+// new button listeners
+$('statusBtn')?.addEventListener('click', openStatusCreate);
+$('addStatusBtn')?.addEventListener('click', openStatusCreate);
+$('statusCreateCloseBtn')?.addEventListener('click', closeStatusCreate);
+$('statusCreateCancelBtn')?.addEventListener('click', closeStatusCreate);
+$('statusCreateSendBtn')?.addEventListener('click', sendStatus);
+$('statusViewerClose')?.addEventListener('click', closeStatusViewer);
+$('wallpaperBtn')?.addEventListener('click', ()=>$('wallpaperModal').classList.remove('hidden'));
+$('wallpaperCloseBtn')?.addEventListener('click', ()=>$('wallpaperModal').classList.add('hidden'));
+$('wallpaperDoneBtn')?.addEventListener('click', ()=>$('wallpaperModal').classList.add('hidden'));
+$('accountBtn')?.addEventListener('click', openAccountModal);
+$('accountCloseBtn')?.addEventListener('click', ()=>$('accountModal').classList.add('hidden'));
+$('accountDoneBtn')?.addEventListener('click', ()=>$('accountModal').classList.add('hidden'));
+$('enable2FABtn')?.addEventListener('click', ()=>wsSend({type:'2fa_enable'}));
+$('verify2FABtn')?.addEventListener('click', ()=>wsSend({type:'2fa_verify', code:$('twoFACode').value.trim()}));
+$('disable2FABtn')?.addEventListener('click', ()=>{ if(confirm('Disable 2FA?')) wsSend({type:'2fa_disable'}); });
+$('exportDataBtn')?.addEventListener('click', exportData);
+$('deleteAccountBtn')?.addEventListener('click', ()=>{
+  const pw=$('deleteConfirmPw').value;
+  if(!pw) return toast('Enter password');
+  if(!confirm('Delete account permanently?')) return;
+  wsSend({type:'account_delete', password: pw});
+});
+$('requestResetBtn')?.addEventListener('click', ()=>wsSend({type:'password_reset_request', username: state.me}));
+$('doResetBtn')?.addEventListener('click', ()=>wsSend({type:'password_reset', token:$('resetTokenInput').value.trim(), password:$('resetNewPw').value}));
+$('pinChatBtn')?.addEventListener('click', togglePinChat);
+$('muteChatBtn')?.addEventListener('click', toggleMuteChat);
+$('clearChatBtn')?.addEventListener('click', clearChat);
+$('disappearingBtn')?.addEventListener('click', openDisappearingModal);
+$('disappearingCloseBtn')?.addEventListener('click', ()=>$('disappearingModal').classList.add('hidden'));
+$('disappearingCancelBtn')?.addEventListener('click', ()=>$('disappearingModal').classList.add('hidden'));
+$('disappearingSaveBtn')?.addEventListener('click', saveDisappearing);
+$('pollBtn')?.addEventListener('click', openPollModal);
+$('pollCloseBtn')?.addEventListener('click', closePollModal);
+$('pollCancelBtn')?.addEventListener('click', closePollModal);
+$('pollCreateBtn')?.addEventListener('click', createPoll);
+$('forwardCloseBtn')?.addEventListener('click', closeForwardPicker);
+$('forwardCancelBtn')?.addEventListener('click', closeForwardPicker);
+$('forwardSendBtn')?.addEventListener('click', doForward);
+$('notifBtn')?.addEventListener('click', enableNotifications);
+$('stickerBtn')?.addEventListener('click', ()=>{ $('emojiPanel').classList.toggle('hidden'); document.querySelector('.emoji-tab[data-tab="sticker"]')?.click(); });
+$('globalSearchBtn')?.addEventListener('click', doGlobalSearch);
+$('headerSearchBtn')?.addEventListener('click', ()=>$('chatSearchBar').classList.toggle('hidden'));
+$('chatSearchClose')?.addEventListener('click', ()=>$('chatSearchBar').classList.add('hidden'));
+$('chatSearchInput')?.addEventListener('input', doChatSearch);
+$('starredCloseBtn')?.addEventListener('click', ()=>$('starredModal').classList.add('hidden'));
+$('starredDoneBtn')?.addEventListener('click', ()=>$('starredModal').classList.add('hidden'));
+// status photo
+$('statusPhotoBtn')?.addEventListener('click', ()=>$('statusPhotoInput').click());
+$('statusPhotoInput')?.addEventListener('change', async ()=>{
+  const f=$('statusPhotoInput').files[0]; if(!f) return;
+  const dataUrl=await resizeImage(f, 800, 0.85);
+  window._statusDataUrl=dataUrl;
+  $('statusPhotoName').textContent=f.name;
+  // upload for url
+  try { const url=await uploadDataUrl(dataUrl, f.name); window._statusUrl=url; } catch(e){ toast(e.message); }
+});
+// filter chips
+document.querySelectorAll('.filter-chip').forEach(ch=>{
+  ch.addEventListener('click', ()=>{
+    document.querySelectorAll('.filter-chip').forEach(x=>x.classList.remove('active'));
+    ch.classList.add('active');
+    state.filter=ch.dataset.filter;
+    if(state.filter==='starred') {
+      // show starred modal instead?
+      // render starred list
+      const list=$('starredList');
+      list.innerHTML='';
+      for(const [cid, chat] of state.chats) {
+        for(const m of chat.messages) if((m.starredBy||[]).includes(state.me)) {
+          const row=document.createElement('div'); row.className='starred-item';
+          row.textContent=`${cid}: ${m.text.slice(0,60)}`;
+          row.addEventListener('click', ()=>{ $('starredModal').classList.add('hidden'); openChat(cid); });
+          list.appendChild(row);
+        }
+      }
+      if(!list.children.length) list.innerHTML='<div class="list-note">No starred messages</div>';
+      $('starredModal').classList.remove('hidden');
+      state.filter='all';
+      document.querySelector('.filter-chip[data-filter="all"]').classList.add('active');
+      ch.classList.remove('active');
+    }
+    renderChatList();
+  });
+});
+// emoji tabs
+document.querySelectorAll('.emoji-tab').forEach(tab=>{
+  tab.addEventListener('click', ()=>{
+    document.querySelectorAll('.emoji-tab').forEach(x=>x.classList.remove('active'));
+    tab.classList.add('active');
+    const t=tab.dataset.tab;
+    $('emojiTabContent').classList.toggle('hidden', t!=='emoji');
+    $('gifTabContent').classList.toggle('hidden', t!=='gif');
+    $('stickerTabContent').classList.toggle('hidden', t!=='sticker');
+  });
+});
+$('searchInput')?.addEventListener('keydown', (e)=>{ if(e.key==='Enter') doGlobalSearch(); });
+// admin add member
+$('addMemberBtn')?.addEventListener('click', ()=>{
+  if(!state.active) return;
+  const modal=$('addMemberModal');
+  const list=$('addMemberList');
+  list.innerHTML='';
+  const g=state.groups.get(state.active);
+  const candidates=state.users.filter(u=>u.name!==state.me && !g.members.includes(u.name));
+  for(const u of candidates){
+    const row=document.createElement('label'); row.className='gm-member';
+    const cb=document.createElement('input'); cb.type='checkbox'; cb.value=u.name;
+    const av=document.createElement('div'); av.className='avatar'; applyAvatar(av,u.name,u.pic);
+    const nameEl=document.createElement('span'); nameEl.textContent=u.name;
+    row.append(cb,av,nameEl); list.appendChild(row);
+  }
+  modal.classList.remove('hidden');
+});
+$('addMemberCloseBtn')?.addEventListener('click', ()=>$('addMemberModal').classList.add('hidden'));
+$('addMemberCancelBtn')?.addEventListener('click', ()=>$('addMemberModal').classList.add('hidden'));
+$('addMemberAddBtn')?.addEventListener('click', ()=>{
+  const names=[...$('addMemberList').querySelectorAll('input:checked')].map(cb=>cb.value);
+  if(!names.length) return toast('Pick members');
+  for(const n of names) wsSend({ type:'group_add_member', groupId: state.active, member:n });
+  $('addMemberModal').classList.add('hidden');
+  toast('Members added');
+});
+// fix STARRED filter etc
+// 2FA show link
+$('show2FALink')?.addEventListener('click', (e)=>{ e.preventDefault(); $('authOtp').classList.remove('hidden'); });
+$('forgotLink')?.addEventListener('click', (e)=>{
+  e.preventDefault();
+  const u=$('authUsername').value.trim();
+  if(!u) return toast('Enter username first');
+  wsSend({ type:'password_reset_request', username:u });
+  toast('Reset token requested (check toast/modal)');
+});
+
