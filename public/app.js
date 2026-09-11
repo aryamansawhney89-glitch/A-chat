@@ -1078,6 +1078,9 @@ function openChat(convoId) {
   const meta = metaFor(convoId);
   if (!meta) return;
   cancelMessageAction(false); // a reply/edit draft belongs to its own chat
+  closeChatMenu();            // the ⋮ menu is per-chat; never carry it over
+  $('chatSearchBar')?.classList.add('hidden');
+  if ($('chatSearchInput')) $('chatSearchInput').value = '';
   state.active = convoId;
   emptyState.classList.add('hidden');
   chatView.classList.remove('hidden');
@@ -1408,6 +1411,7 @@ function buildBubble(m, prev) {
     bubble.appendChild(buildVoicePlayer(m));
   }
   if (m.kind === 'poll' && m.media) {
+    bubble.classList.add('poll-bubble');
     bubble.appendChild(buildPollEl(m));
   }
 
@@ -1439,7 +1443,11 @@ function buildBubble(m, prev) {
     // will be handled in text rendering below via innerHTML with highlight
   }
   if (m.text) {
-    if (m.kind === 'sticker' && !m.media) {
+    if (m.kind === 'poll' && m.media) {
+      // the card already shows the question as its headline — don't repeat the
+      // text under it (that double-rendered every poll)
+      bubble.appendChild(metaEl);
+    } else if (m.kind === 'sticker' && !m.media) {
       // already rendered sticker text big, just add meta
       bubble.appendChild(metaEl);
     } else if (m.kind === 'photo' || m.kind === 'sticker' || m.kind === 'gif') {
@@ -3313,7 +3321,8 @@ document.addEventListener('keydown', (e) => {
     $('starredModal')?.classList.add('hidden');
     $('accountModal')?.classList.add('hidden');
     $('addMemberModal')?.classList.add('hidden');
-    $('chatSearchBar')?.classList.add('hidden');
+    closeChatMenu();
+    if ($('chatSearchBar') && !$('chatSearchBar').classList.contains('hidden')) closeChatSearch();
     $('searchResults')?.classList.add('hidden');
   }
 });
@@ -3341,48 +3350,95 @@ if (storedToken && storedName) {
 /* ==================== new feature helpers ==================== */
 
 function buildPollEl(m) {
+  const media = m.media || {};
+  const options = Array.isArray(media.options) ? media.options : [];
+  const closed = !!media.closed;
+  const multiple = !!media.multiple;
+  const votesOf = (o) => (o && Array.isArray(o.votes) ? o.votes : []);
+  const total = options.reduce((s, o) => s + votesOf(o).length, 0);
+
   const wrap = document.createElement('div');
   wrap.className = 'poll-wrap';
+
+  const head = document.createElement('div');
+  head.className = 'poll-head';
+  head.textContent = multiple ? '📊 Poll · multiple answers' : '📊 Poll';
+  wrap.appendChild(head);
+
   const q = document.createElement('div');
   q.className = 'poll-question';
-  q.textContent = m.media.question;
+  q.textContent = media.question || m.text || '';
   wrap.appendChild(q);
-  const total = m.media.options.reduce((s,o)=>s+o.votes.length,0) || 1;
-  m.media.options.forEach((opt, idx) => {
-    const row = document.createElement('div');
-    row.className = 'poll-option';
-    const btn = document.createElement('button');
-    btn.className = 'poll-vote-btn';
-    btn.textContent = opt.text;
-    if (opt.votes.includes(state.me)) btn.classList.add('voted');
-    if (m.media.closed) btn.disabled = true;
-    btn.addEventListener('click', () => wsSend({ type: 'poll_vote', convoId: m.convoId, id: m.id, optionIndex: idx }));
-    const bar = document.createElement('div');
+
+  const list = document.createElement('div');
+  list.className = 'poll-list';
+  options.forEach((opt, idx) => {
+    const votes = votesOf(opt);
+    const pct = total ? Math.round((votes.length / total) * 100) : 0;
+    const mine = votes.includes(state.me);
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'poll-option' + (mine ? ' voted' : '');
+    row.disabled = closed;
+    row.title = closed ? 'This poll is closed' : mine ? 'Remove your vote' : 'Vote for this option';
+    const radio = document.createElement('span');
+    radio.className = 'poll-radio';
+    radio.textContent = multiple ? (mine ? '☑' : '☐') : (mine ? '●' : '○');
+    const body = document.createElement('span');
+    body.className = 'poll-body';
+    const line = document.createElement('span');
+    line.className = 'poll-line';
+    const label = document.createElement('span');
+    label.className = 'poll-opt-text';
+    label.textContent = (opt && opt.text) || '';
+    const pctEl = document.createElement('span');
+    pctEl.className = 'poll-pct';
+    pctEl.textContent = pct + '%';
+    line.append(label, pctEl);
+    const bar = document.createElement('span');
     bar.className = 'poll-bar';
-    const fill = document.createElement('div');
+    const fill = document.createElement('span');
     fill.className = 'poll-fill';
-    fill.style.width = Math.round((opt.votes.length/total)*100)+'%';
+    fill.style.width = pct + '%';
     bar.appendChild(fill);
     const count = document.createElement('span');
     count.className = 'poll-count';
-    count.textContent = opt.votes.length + ' vote' + (opt.votes.length!==1?'s':'');
-    if (opt.votes.includes(state.me)) count.textContent += ' • you';
-    row.append(btn, bar, count);
-    wrap.appendChild(row);
+    count.textContent = votes.length
+      ? votes.length + ' vote' + (votes.length !== 1 ? 's' : '') + (mine ? ' • you voted' : '')
+      : 'No votes';
+    body.append(line, bar, count);
+    row.append(radio, body);
+    row.addEventListener('click', () => wsSend({ type: 'poll_vote', convoId: m.convoId, id: m.id, optionIndex: idx }));
+    list.appendChild(row);
   });
-  if (!m.media.closed && (m.from===state.me || isGroupAdmin(m.convoId, state.me))) {
-    const closeBtn = document.createElement('button');
-    closeBtn.className = 'btn';
-    closeBtn.textContent = 'Close poll';
-    closeBtn.style.marginTop='8px';
-    closeBtn.addEventListener('click', ()=>wsSend({type:'poll_close', convoId:m.convoId, id:m.id}));
-    wrap.appendChild(closeBtn);
+  wrap.appendChild(list);
+
+  const foot = document.createElement('div');
+  foot.className = 'poll-foot';
+  const totalEl = document.createElement('span');
+  totalEl.className = 'poll-total';
+  totalEl.textContent = total ? `${total} vote${total !== 1 ? 's' : ''}` : 'No votes yet';
+  foot.appendChild(totalEl);
+  if (closed) {
+    const chip = document.createElement('span');
+    chip.className = 'poll-closed';
+    chip.textContent = 'Poll closed';
+    foot.appendChild(chip);
+  } else {
+    const hint = document.createElement('span');
+    hint.className = 'poll-hint';
+    hint.textContent = 'Tap an option to vote';
+    foot.appendChild(hint);
   }
-  if (m.media.closed) {
-    const closed = document.createElement('div');
-    closed.className = 'poll-closed';
-    closed.textContent = 'Poll closed';
-    wrap.appendChild(closed);
+  wrap.appendChild(foot);
+
+  if (!closed && (m.from === state.me || isGroupAdmin(m.convoId, state.me))) {
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'btn poll-close-btn';
+    closeBtn.textContent = '🔒 Close poll';
+    closeBtn.addEventListener('click', () => wsSend({ type: 'poll_close', convoId: m.convoId, id: m.id }));
+    wrap.appendChild(closeBtn);
   }
   return wrap;
 }
@@ -3413,7 +3469,8 @@ function showEditHistory(m) {
 }
 let forwardPending = null;
 function openForwardPicker(m) {
-  forwardPending = m;
+  // the header ↗️ forwards the newest message; both paths need a convoId to copy from
+  forwardPending = m.convoId ? m : { ...m, convoId: state.active };
   const list = $('forwardList');
   list.innerHTML = '';
   for (const c of listEntries()) {
@@ -3588,19 +3645,149 @@ function doGlobalSearch(){
   wsSend({ type:'search_messages', query: q });
 }
 function doChatSearch(){
-  const q=$('chatSearchInput').value.trim().toLowerCase();
+  const input=$('chatSearchInput');
   const chat=getChat(state.active);
-  if (!chat) return;
+  if (!chat || !input) return;
+  const q=input.value.trim().toLowerCase();
   messagesEl.innerHTML='';
   state.lastDateLabel=null;
   let prev=null;
+  let hits=0;
   for (const m of chat.messages) {
-    if (q && !(m.text||'').toLowerCase().includes(q)) continue;
+    // a tombstone can't match a query, but with an empty query the list shows
+    // exactly what renderMessages() would show (tombstones included)
+    if (q && m.deleted) continue;
+    if (q && !chatSearchHaystack(m).includes(q)) continue;
+    hits++;
     const label=dateLabel(m.ts);
     if (label!==state.lastDateLabel){ messagesEl.appendChild(daySep(label)); state.lastDateLabel=label; prev=null; }
     messagesEl.appendChild(buildBubble(m, prev));
     prev=m;
   }
+  if (q && !hits) {
+    const note=document.createElement('div');
+    note.className='chat-search-empty';
+    note.textContent=`No messages match “${input.value.trim()}”`;
+    messagesEl.appendChild(note);
+  }
+  if (q) scrollBottom(false);
+}
+// Match on the visible text: message body plus poll questions/options, so
+// "search in chat" finds more than plain texts.
+function chatSearchHaystack(m){
+  const parts=[m.text||''];
+  if (m.kind==='poll' && m.media){
+    parts.push(m.media.question||'');
+    for (const o of (m.media.options||[])) parts.push(o && o.text || '');
+  }
+  if (m.kind==='gif') parts.push('gif');
+  if (m.kind==='sticker') parts.push('sticker');
+  if (m.kind==='photo') parts.push(m.media && m.media.name || 'photo');
+  if (m.kind==='voice') parts.push('voice message');
+  return parts.join('\n').toLowerCase();
+}
+function openChatSearch(){
+  const bar=$('chatSearchBar');
+  if (!bar) return;
+  if (!state.active) { toast('Open a chat first'); return; }
+  bar.classList.remove('hidden');
+  const input=$('chatSearchInput');
+  if (input) { input.focus(); input.select(); }
+  doChatSearch();
+}
+function toggleChatSearch(){
+  const bar=$('chatSearchBar');
+  if (!bar) return;
+  if (bar.classList.contains('hidden')) openChatSearch();
+  else closeChatSearch();
+}
+function closeChatSearch(){
+  const bar=$('chatSearchBar');
+  const input=$('chatSearchInput');
+  if (bar) bar.classList.add('hidden');
+  if (input) input.value='';
+  // restore the unfiltered list, otherwise the chat stays stuck on the results
+  const chat=state.active && getChat(state.active);
+  if (chat) renderMessages(chat);
+}
+/* ↗️ in the chat header: forward the newest message of the open chat. (Long-press
+   any bubble to forward a specific one instead.) */
+function forwardLatest(){
+  if (!state.active) { toast('Open a chat first'); return; }
+  const chat=getChat(state.active);
+  const latest=[...chat.messages].reverse().find(m=>!m.deleted);
+  if (!latest) { toast('Nothing to forward yet'); return; }
+  openForwardPicker(latest);
+}
+/* ⋮ chat menu — the header buttons got crowded, so the per-chat actions live in
+   this dropdown. Built on the fly so the labels reflect current state. */
+let chatMenuEl=null;
+function chatMenuAway(e){
+  if (chatMenuEl && !chatMenuEl.contains(e.target)) closeChatMenu();
+}
+function closeChatMenu(){
+  if (chatMenuEl && chatMenuEl.parentNode) chatMenuEl.parentNode.removeChild(chatMenuEl);
+  chatMenuEl=null;
+  document.removeEventListener('pointerdown', chatMenuAway, true);
+  document.removeEventListener('keydown', chatMenuKey, true);
+  $('chatMenuBtn')?.classList.remove('active');
+}
+function chatMenuKey(e){
+  if (e.key==='Escape') { e.stopPropagation(); e.preventDefault(); closeChatMenu(); }
+}
+function chatMenuItems(){
+  const pinned=(state.pinnedChats||[]).includes(state.active);
+  const muted=isMuted(state.active);
+  const sec=state.disappearing.get(state.active)||0;
+  const secLabel=sec ? (sec<60 ? sec+'s' : sec<3600 ? Math.floor(sec/60)+'m' : Math.floor(sec/3600)+'h') : '';
+  return [
+    { icon:'🔍', label:'Search in chat', fn: openChatSearch },
+    { icon:'📌', label: pinned ? 'Unpin chat' : 'Pin chat', fn: togglePinChat },
+    { icon: muted ? '🔔' : '🔕', label: muted ? 'Unmute notifications' : 'Mute notifications', fn: toggleMuteChat },
+    { icon:'⏳', label:'Disappearing messages' + (secLabel ? ' · ' + secLabel : ''), fn: openDisappearingModal },
+    { icon:'🎨', label:'Wallpaper', fn: ()=>$('wallpaperModal')?.classList.remove('hidden') },
+    { icon:'🧹', label:'Clear chat', fn: clearChat, danger:true },
+  ];
+}
+function openChatMenu(){
+  if (!state.active) { toast('Open a chat first'); return; }
+  closeChatMenu();
+  const menu=document.createElement('div');
+  menu.className='chat-menu';
+  menu.setAttribute('role','menu');
+  const head=document.createElement('div');
+  head.className='chat-menu-head';
+  head.textContent=(metaFor(state.active)||{}).title||'Chat';
+  menu.appendChild(head);
+  for (const item of chatMenuItems()) {
+    const btn=document.createElement('button');
+    btn.className='chat-menu-item' + (item.danger ? ' danger' : '');
+    btn.setAttribute('role','menuitem');
+    const ico=document.createElement('span');
+    ico.className='cm-icon';
+    ico.textContent=item.icon;
+    const txt=document.createElement('span');
+    txt.textContent=item.label;
+    btn.append(ico,txt);
+    btn.addEventListener('click', ()=>{ closeChatMenu(); item.fn(); });
+    menu.appendChild(btn);
+  }
+  document.body.appendChild(menu);
+  // anchor under the ⋮ button, flipping up/left if it would overflow
+  const rect=$('chatMenuBtn').getBoundingClientRect();
+  const h=menu.offsetHeight, w=menu.offsetWidth;
+  const top=rect.bottom+6+h>window.innerHeight ? Math.max(8, rect.top-h-6) : rect.bottom+6;
+  const left=Math.max(8, Math.min(rect.right-w, window.innerWidth-w-8));
+  menu.style.top=top+'px';
+  menu.style.left=left+'px';
+  chatMenuEl=menu;
+  $('chatMenuBtn')?.classList.add('active');
+  setTimeout(()=>document.addEventListener('pointerdown', chatMenuAway, true), 0);
+  document.addEventListener('keydown', chatMenuKey, true);
+}
+function toggleChatMenu(){
+  if (chatMenuEl) closeChatMenu();
+  else openChatMenu();
 }
 function togglePinChat(){
   if (!state.active) return;
@@ -3635,9 +3822,14 @@ function clearChat(){
   if (!confirm('Clear chat for you only? This hides all messages.')) return;
   wsSend({ type:'clear_chat', convoId: state.active });
 }
-function openPollModal(){ if(!state.active) return; $('pollModal').classList.remove('hidden'); }
+function openPollModal(){
+  if (!state.active) { toast('Open a chat first'); return; }
+  $('pollModal')?.classList.remove('hidden');
+  $('pollQuestion')?.focus();
+}
 function closePollModal(){ $('pollModal').classList.add('hidden'); }
 function createPoll(){
+  if (!state.active) { toast('Open a chat first'); return; }
   const q=$('pollQuestion').value.trim();
   const opts=[...document.querySelectorAll('.poll-opt')].map(i=>i.value.trim()).filter(Boolean);
   if (!q || opts.length<2) { toast('Add question + at least 2 options'); return; }
@@ -3646,26 +3838,136 @@ function createPoll(){
   closePollModal();
   $('pollQuestion').value=''; document.querySelectorAll('.poll-opt').forEach(i=>i.value='');
 }
+/* ---------------------------------- GIFs -------------------------------------
+ * Real search: every query hits GET /api/gifs (Tenor, proxied server-side so the
+ * API key never ships to the browser). An empty query shows trending GIFs, typing
+ * is debounced, and if the provider can't be reached we fall back to the built-in
+ * GIFS list so the picker is never just dead. */
+
+const GIF_DEBOUNCE_MS = 260;
+let gifSeq = 0;       // response guard: only the newest query may render
+let gifTimer = null;  // debounce handle
+let gifBusy = false;  // a fetch is in flight
+let gifLoaded = false; // trending has been fetched at least once this page load
+
+function setGifStatus(text) {
+  const el = $('gifStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('hidden', !text);
+}
+// providers ask to be credited when their content is shown
+function setGifAttribution(text) {
+  const el = $('gifAttrib');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('hidden', !text);
+}
+
+function localGifs(query) {
+  const f = String(query || '').trim().toLowerCase();
+  const list = f
+    ? GIFS.filter((g) => g.tags.some((t) => t.includes(f) || f.includes(t)) || g.url.toLowerCase().includes(f))
+    : GIFS;
+  return list.map((g, i) => ({ id: 'local' + i, url: g.url, previewUrl: g.url, alt: g.tags.join(' ') || 'GIF' }));
+}
+
+function renderGifGrid(results, note) {
+  const grid = $('gifGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  if (!results.length) {
+    const empty = document.createElement('div');
+    empty.className = 'gif-empty';
+    empty.textContent = 'No GIFs found';
+    grid.appendChild(empty);
+    setGifStatus(note || '');
+    return;
+  }
+  for (const g of results) {
+    const img = document.createElement('img');
+    img.className = 'gif-thumb';
+    img.src = g.previewUrl || g.url;
+    img.alt = g.alt || 'GIF';
+    img.title = 'Send this GIF';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => img.classList.add('gif-broken'), { once: true });
+    img.addEventListener('click', () => {
+      if (!state.active) { toast('Open a chat first'); return; }
+      const media = { url: g.url };
+      if (Number.isFinite(g.w)) media.w = g.w;
+      if (Number.isFinite(g.h)) media.h = g.h;
+      wsSend({ type: 'message', convoId: state.active, kind: 'gif', text: '', media });
+      emojiPanel.classList.add('hidden');
+    });
+    grid.appendChild(img);
+  }
+  setGifStatus(note || ''); // clear the "Searching…" line once results land
+}
+
+function gifBusyText(query) {
+  return String(query || '').trim() ? 'Searching…' : 'Loading trending GIFs…';
+}
+async function loadGifs(query) {
+  const grid = $('gifGrid');
+  if (!grid) return;
+  const q = String(query || '').trim();
+  const seq = ++gifSeq;
+  gifBusy = true;
+  grid.innerHTML = '';
+  setGifStatus(gifBusyText(q));
+  let results = null;
+  let offline = false;
+  let attribution = '';
+  try {
+    const r = await fetch(`/api/gifs?q=${encodeURIComponent(q)}&limit=24`);
+    const j = await r.json().catch(() => null);
+    if (j && j.ok && Array.isArray(j.results)) {
+      results = j.results;
+      attribution = j.attribution || '';
+    } else {
+      offline = true;
+    }
+  } catch {
+    offline = true;
+  }
+  if (seq !== gifSeq) return; // a newer query already won — don't stomp it
+  gifBusy = false;
+  gifLoaded = true;
+  setGifAttribution(attribution);
+  if (!results) {
+    // Provider unreachable: fall back to the built-in list filtered locally, so the
+    // panel is never just dead. A query with no local match says "No GIFs found".
+    results = localGifs(q);
+    renderGifGrid(results, results.length
+      ? 'GIF provider unreachable — showing built-in GIFs'
+      : 'GIF provider unreachable — try again in a moment');
+    return;
+  }
+  renderGifGrid(results, '');
+}
+
+function queueGifSearch(value) {
+  clearTimeout(gifTimer);
+  setGifStatus(gifBusyText(value)); // feedback starts on the first keystroke…
+  gifTimer = setTimeout(() => loadGifs(value), GIF_DEBOUNCE_MS); // …the fetch waits
+}
+
+/* Switch the emoji panel between its 😊 / GIF / Sticker tabs. Called both by the
+   tab buttons and by the 🎭 composer button; opening the GIF tab lazily fetches
+   trending GIFs the first time (no network on page load). */
+function switchEmojiTab(name) {
+  const t = name || 'emoji';
+  document.querySelectorAll('.emoji-tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === t));
+  $('emojiTabContent')?.classList.toggle('hidden', t !== 'emoji');
+  $('gifTabContent')?.classList.toggle('hidden', t !== 'gif');
+  $('stickerTabContent')?.classList.toggle('hidden', t !== 'sticker');
+  if (t === 'gif' && !gifLoaded && !gifBusy) loadGifs($('gifSearch') ? $('gifSearch').value : '');
+}
 function setupGifStickers(){
   // GIF search
-  const gifSearch=$('gifSearch');
-  const gifGrid=$('gifGrid');
-  function renderGifs(filter=''){
-    gifGrid.innerHTML='';
-    const f=filter.toLowerCase();
-    for (const g of GIFS) {
-      if (f && !g.tags.some(t=>t.includes(f)) && !g.url.includes(f)) continue;
-      const img=document.createElement('img');
-      img.src=g.url; img.className='gif-thumb';
-      img.addEventListener('click', ()=>{
-        wsSend({ type:'message', convoId: state.active, kind:'gif', text:'', media:{ url:g.url } });
-        $('emojiPanel').classList.add('hidden');
-      });
-      gifGrid.appendChild(img);
-    }
-  }
-  if(gifSearch) gifSearch.addEventListener('input', ()=>renderGifs(gifSearch.value));
-  renderGifs();
+  const gifSearch = $('gifSearch');
+  if (gifSearch) gifSearch.addEventListener('input', () => queueGifSearch(gifSearch.value));
   // Stickers
   const stickerGrid=$('stickerGrid');
   if (stickerGrid) {
@@ -3676,6 +3978,7 @@ function setupGifStickers(){
       btn.textContent=s;
       btn.style.fontSize='32px';
       btn.addEventListener('click', ()=>{
+        if (!state.active) { toast('Open a chat first'); return; }
         wsSend({ type:'message', convoId: state.active, kind:'sticker', text:s, media:null });
         $('emojiPanel').classList.add('hidden');
       });
@@ -3773,11 +4076,24 @@ $('forwardCloseBtn')?.addEventListener('click', closeForwardPicker);
 $('forwardCancelBtn')?.addEventListener('click', closeForwardPicker);
 $('forwardSendBtn')?.addEventListener('click', doForward);
 $('notifBtn')?.addEventListener('click', enableNotifications);
-$('stickerBtn')?.addEventListener('click', ()=>{ $('emojiPanel').classList.toggle('hidden'); document.querySelector('.emoji-tab[data-tab="sticker"]')?.click(); });
+// 🎭 opens the sticker/GIF panel. The panel is dismissed by a document-level click
+// handler, so without stopPropagation this button was hiding its own panel inside
+// the same click. It now opens the panel straight on the GIF tab.
+$('stickerBtn')?.addEventListener('click', (e)=>{
+  e.stopPropagation();
+  const panel=$('emojiPanel');
+  if (!panel) return;
+  const willOpen=panel.classList.contains('hidden');
+  panel.classList.toggle('hidden');
+  if (willOpen) switchEmojiTab('gif');
+});
 $('globalSearchBtn')?.addEventListener('click', doGlobalSearch);
-$('headerSearchBtn')?.addEventListener('click', ()=>$('chatSearchBar').classList.toggle('hidden'));
-$('chatSearchClose')?.addEventListener('click', ()=>$('chatSearchBar').classList.add('hidden'));
+$('headerSearchBtn')?.addEventListener('click', toggleChatSearch);
+$('chatSearchClose')?.addEventListener('click', closeChatSearch);
 $('chatSearchInput')?.addEventListener('input', doChatSearch);
+$('forwardHeaderBtn')?.addEventListener('click', forwardLatest);
+$('chatMenuBtn')?.addEventListener('click', (e)=>{ e.stopPropagation(); toggleChatMenu(); });
+window.addEventListener('resize', closeChatMenu); // a fixed-position menu must not float loose
 $('starredCloseBtn')?.addEventListener('click', ()=>$('starredModal').classList.add('hidden'));
 $('starredDoneBtn')?.addEventListener('click', ()=>$('starredModal').classList.add('hidden'));
 // status photo
@@ -3820,15 +4136,9 @@ document.querySelectorAll('.filter-chip').forEach(ch=>{
 });
 // emoji tabs
 document.querySelectorAll('.emoji-tab').forEach(tab=>{
-  tab.addEventListener('click', ()=>{
-    document.querySelectorAll('.emoji-tab').forEach(x=>x.classList.remove('active'));
-    tab.classList.add('active');
-    const t=tab.dataset.tab;
-    $('emojiTabContent').classList.toggle('hidden', t!=='emoji');
-    $('gifTabContent').classList.toggle('hidden', t!=='gif');
-    $('stickerTabContent').classList.toggle('hidden', t!=='sticker');
-  });
+  tab.addEventListener('click', ()=>switchEmojiTab(tab.dataset.tab));
 });
+switchEmojiTab('emoji');
 $('searchInput')?.addEventListener('keydown', (e)=>{ if(e.key==='Enter') doGlobalSearch(); });
 // admin add member
 $('addMemberBtn')?.addEventListener('click', ()=>{

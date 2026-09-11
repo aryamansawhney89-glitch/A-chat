@@ -14,7 +14,11 @@
  *   partial decline, member added mid-call via call_add, leave lifecycle, call
  *   log) → privacy & Ghost Mode (per-setting toggles, hidden presence,
  *   suppressed read receipts / typing / delivery, call gating, persistence) →
- *   oversized upload rejected → JSON persistence (with legacy
+ *   GIF search API (provider chain against stub providers: GIPHY + Tenor
+ *   payload shapes, rendition selection, caching, failover, stale-cache and
+ *   error fallbacks) → polls (tallies
+ *   broadcast, toggle votes, close permissions) → forwarding (origin label,
+ *   membership check) → oversized upload rejected → JSON persistence (with legacy
  *   messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
@@ -148,6 +152,75 @@ function makeWavDataUrl() {
 (async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'a-chat-test-'));
 
+  // Stub GIF providers so /api/gifs can be exercised offline. Both configured
+  // providers are served by one tiny server: GIPHY-shaped results under /giphy,
+  // Tenor-shaped under /v1, which is what lets the failover be tested too.
+  const GIF_PORT = Number(process.env.TEST_GIF_PORT || PORT + 1);
+  const gifState = { fail: false, hits: [] };
+  const giphyPayload = () => ({
+    data: [
+      {
+        id: 'g1',
+        title: 'party bob',
+        images: {
+          fixed_width: { url: 'https://media.giphy.com/media/g1/fixed_width.gif', width: '480', height: '360' },
+          fixed_width_small: { url: 'https://media.giphy.com/media/g1/small.gif', width: '200', height: '150' },
+          original: { url: 'https://media.giphy.com/media/g1/giphy.gif', width: '480', height: '360' },
+        },
+      },
+      {
+        id: 'g2',
+        slug: 'confetti-cat',
+        images: {
+          fixed_width_downsampled: { url: 'https://media.giphy.com/media/g2/down.gif', width: '400', height: '300' },
+          downsized_small: { url: 'https://media.giphy.com/media/g2/small.gif', width: '220', height: '165' },
+          // mp4 renditions must never be offered: the message sanitizer would reject them
+          looping: { url: 'https://media.giphy.com/media/g2/loop.mp4', width: '400', height: '300' },
+        },
+      },
+      // junk that must be dropped: a javascript: url, and a gif with no renditions
+      { id: 'g3', images: { original: { url: 'javascript:alert(1)' } } },
+      { id: 'g4', images: {} },
+    ],
+  });
+  const tenorPayload = () => ({
+    results: [
+      {
+        id: 'p1',
+        title: 'party bob',
+        media: [
+          {
+            nanogif: { url: 'https://media.tenor.com/nano/party.gif', dims: { width: 220, height: 160 } },
+            tinygif: { url: 'https://media.tenor.com/tiny/party.gif', dims: { width: 320, height: 240 } },
+            gif: { url: 'https://media.tenor.com/full/party.gif', dims: { width: 498, height: 373 } },
+          },
+        ],
+      },
+      { id: 'p2', content_description: 'confetti cat', media_formats: { tinygif: { url: 'https://media.tenor.com/tiny/confetti.gif', dims: { w: 220, h: 165 } }, gif: { url: 'https://media.tenor.com/full/confetti.gif', dims: { w: 400, h: 300 } } } },
+    ],
+  });
+  const gifMock = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://127.0.0.1:${GIF_PORT}`);
+    gifState.hits.push(url.pathname + url.search);
+    const send = (code, obj) => {
+      res.writeHead(code, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (gifState.fail) return send(500, { error: 'provider down' });
+    const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const isGiphy = url.pathname.startsWith('/giphy');
+    if (q === 'boom') return send(500, { error: 'kaboom' });
+    if (q === 'tenoronly' && isGiphy) return send(500, { error: 'giphy is down' });
+    if (q === 'mp4only') return send(200, isGiphy
+      ? { data: [{ id: 'v1', images: { looping: { url: 'https://media.giphy.com/media/v1/loop.mp4' } } }] }
+      : { results: [{ id: 'v1', media_formats: { loop: { url: 'https://media.tenor.com/clip.mp4', dims: { w: 100, h: 100 } } } }] });
+    if (q === 'nothing') return send(200, isGiphy ? { data: [] } : { results: [] });
+    if (isGiphy && (url.pathname.endsWith('/search') || url.pathname.endsWith('/trending'))) return send(200, giphyPayload());
+    if (!isGiphy && (url.pathname === '/v1/search' || url.pathname === '/v1/trending')) return send(200, tenorPayload());
+    return send(404, { error: 'not found' });
+  });
+  await new Promise((r) => gifMock.listen(GIF_PORT, '127.0.0.1', r));
+
   // Pre-seed a LEGACY messages.json (pre-convoId format) to verify migration.
   fs.writeFileSync(
     path.join(dataDir, 'messages.json'),
@@ -161,7 +234,17 @@ function makeWavDataUrl() {
   console.log(`Starting server on :${PORT} (data: ${dataDir})`);
   const server = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, CALL_RING_TIMEOUT_MS: '1500' },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      DATA_DIR: dataDir,
+      CALL_RING_TIMEOUT_MS: '1500',
+      // point the GIF proxy at the stub, with a short TTL so cache expiry is testable
+      GIF_PROVIDERS: 'giphy,klipy,tenor',
+      GIPHY_API_BASE: `http://127.0.0.1:${GIF_PORT}/giphy`,
+      TENOR_API_BASE: `http://127.0.0.1:${GIF_PORT}/v1`,
+      GIF_CACHE_TTL_MS: '3000',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', (d) => process.stdout.write('[server] ' + d));
@@ -917,6 +1000,100 @@ function makeWavDataUrl() {
     ghostyBack.close();
     watcher.close();
 
+    console.log('\n— GIF search API (provider chain) —');
+    {
+      const parse = (r) => JSON.parse(r.body.toString());
+      const first = parse(await httpGet(PORT, '/api/gifs?q=party&limit=24'));
+      ok('/api/gifs answers ok + a results array', first.ok === true && Array.isArray(first.results), JSON.stringify(first).slice(0, 200));
+      ok('the configured primary provider answers first', first.source === 'giphy' && /GIPHY/.test(first.attribution || ''), JSON.stringify({ s: first.source, a: first.attribution }));
+      ok('only the primary provider is called when it works', gifState.hits.every((h) => h.startsWith('/giphy')), gifState.hits.join(','));
+      ok('unusable entries (javascript: url, no renditions) are dropped', first.results.length === 2, JSON.stringify(first.results));
+      ok('the sent url is the crisp rendition, not the thumbnail', first.results[0].url === 'https://media.giphy.com/media/g1/fixed_width.gif', JSON.stringify(first.results[0]));
+      ok('the picker preview uses the small rendition', first.results[0].previewUrl === 'https://media.giphy.com/media/g1/small.gif', first.results[0].previewUrl);
+      ok('string dimensions and alt text are normalised', first.results[0].w === 480 && first.results[0].h === 360 && first.results[1].alt === 'confetti-cat', JSON.stringify(first.results[1]));
+
+      const hitsSoFar = gifState.hits.length;
+      const again = parse(await httpGet(PORT, '/api/gifs?q=party&limit=24'));
+      ok('repeat query is served from the 5-minute cache (no provider hit)', again.cached === true && gifState.hits.length === hitsSoFar);
+      const trend = parse(await httpGet(PORT, '/api/gifs?q=&limit=24'));
+      ok('empty query uses trending instead of search', trend.ok === true && gifState.hits.some((h) => h.includes('/giphy/trending')), gifState.hits.join(','));
+      parse(await httpGet(PORT, '/api/gifs?q=clamp&limit=999'));
+      ok('limit is clamped to what a provider may return', /limit=50(&|$)/.test(gifState.hits[gifState.hits.length - 1]), gifState.hits[gifState.hits.length - 1]);
+      ok('providers without a key (klipy) are skipped, not called', gifState.hits.every((h) => !/klipy/i.test(h)));
+
+      const bad = await httpGet(PORT, '/api/gifs?q=boom');
+      ok('every provider failing → 502 + ok:false (client shows its built-in list)', bad.status === 502 && parse(bad).ok === false);
+      const mp4 = await httpGet(PORT, '/api/gifs?q=mp4only');
+      ok('non-gif renditions are never handed to the client', mp4.status === 502 && parse(mp4).results.length === 0);
+      const empty = await httpGet(PORT, '/api/gifs?q=nothing');
+      ok('an empty result set is an error, not an empty success', empty.status === 502);
+      const over = parse(await httpGet(PORT, '/api/gifs?q=tenoronly&limit=24'));
+      ok('a dead primary provider fails over to the next one', over.ok === true && over.source === 'tenor', JSON.stringify({ s: over.source }));
+      ok('failover keeps the same normalised shape', over.results[0].url === 'https://media.tenor.com/full/party.gif' && over.results[0].previewUrl === 'https://media.tenor.com/nano/party.gif', JSON.stringify(over.results[0]));
+
+      // a searched GIF url must survive the server message sanitising, or the picker
+      // would show results you cannot actually send
+      alice.send({ type: 'message', convoId: dmAB, kind: 'gif', text: '', media: { url: first.results[0].url, w: first.results[0].w, h: first.results[0].h } });
+      const gifMsg = await bob.waitFor('message', (e) => e.message.kind === 'gif');
+      ok('searched gif url is accepted and relayed', gifMsg.message.media && gifMsg.message.media.url === first.results[0].url, JSON.stringify(gifMsg.message.media));
+      const before = bob.events.filter((e) => e.type === 'message').length;
+      alice.send({ type: 'message', convoId: dmAB, kind: 'gif', text: '', media: { url: 'http://plain-http.example/x.gif' } });
+      alice.send({ type: 'message', convoId: dmAB, kind: 'gif', text: '', media: null });
+      await sleep(250);
+      ok('non-https / media-less gif messages are rejected (no empty bubbles)', bob.events.filter((e) => e.type === 'message').length === before);
+
+      // stale cache keeps the picker alive after every provider dies
+      gifState.fail = true;
+      await sleep(3200); // > GIF_CACHE_TTL_MS (3s in tests)
+      const stale = parse(await httpGet(PORT, '/api/gifs?q=party&limit=24'));
+      ok('expired cache is served stale while the providers are down', stale.ok === true && /stale cache/.test(stale.source) && stale.results.length === 2, JSON.stringify(stale).slice(0, 160));
+      const freshFail = parse(await httpGet(PORT, '/api/gifs?q=novelquery'));
+      ok('unknown query with dead providers still degrades cleanly', freshFail.ok === false && freshFail.results.length === 0);
+      gifState.fail = false;
+    }
+
+    console.log('\n— polls —');
+    {
+      alice.send({ type: 'message', convoId: gid, kind: 'poll', text: 'Pizza night?', media: { question: 'Pizza night?', options: [{ text: 'Yes' }, { text: 'No' }], multiple: false } });
+      const poll = (await bob.waitFor('message', (e) => e.message.kind === 'poll')).message;
+      ok('poll keeps question in media (card headline)', poll.media.question === 'Pizza night?');
+      ok('poll keeps text for the sidebar preview (bubble renders it once)', poll.text === 'Pizza night?');
+      ok('options arrive with vote arrays for the % bars', poll.media.options.length === 2 && Array.isArray(poll.media.options[0].votes) && poll.media.options[0].votes.length === 0);
+      bob.send({ type: 'poll_vote', convoId: gid, id: poll.id, optionIndex: 0 });
+      const upd = await alice.waitFor('poll_update', (e) => e.id === poll.id);
+      ok('vote is broadcast to the other members', upd.media.options[0].votes.includes('Bob'));
+      alice.send({ type: 'poll_vote', convoId: gid, id: poll.id, optionIndex: 1 });
+      const upd2 = await bob.waitFor('poll_update', (e) => e.id === poll.id && e.media.options[1].votes.length === 1);
+      ok('each option tallies independently (drives per-option % + bar width)', upd2.media.options[0].votes.length === 1 && upd2.media.options[1].votes.length === 1);
+      bob.send({ type: 'poll_vote', convoId: gid, id: poll.id, optionIndex: 1 });
+      const untally = await bob.waitFor('poll_update', (e) => e.id === poll.id && e.media.options[1].votes.length === 0);
+      ok('tapping your option again removes the vote', !untally.media.options[1].votes.includes('Bob'));
+      bob.send({ type: 'poll_close', convoId: gid, id: poll.id });
+      await sleep(300);
+      ok('a plain member cannot close someone else’s poll', !alice.events.some((e) => e.type === 'poll_update' && e.id === poll.id && e.media.closed));
+      alice.send({ type: 'poll_close', convoId: gid, id: poll.id });
+      const closed = await bob.waitFor('poll_update', (e) => e.id === poll.id && e.media.closed === true);
+      ok('the poll author can close it (button then renders disabled)', !!closed);
+      const marks = bob.events.length;
+      bob.send({ type: 'poll_vote', convoId: gid, id: poll.id, optionIndex: 0 });
+      await sleep(300);
+      ok('votes on a closed poll are ignored', !bob.events.slice(marks).some((e) => e.type === 'poll_update' && e.id === poll.id));
+    }
+
+    console.log('\n— forward (header ↗️ + long-press share one path) —');
+    {
+      bob.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'forward me please' });
+      const src = (await alice.waitFor('message', (e) => e.message.text === 'forward me please')).message;
+      alice.send({ type: 'forward', messageId: src.id, fromConvoId: dmAB, toConvoIds: [gid] });
+      const fwd = await bob.waitFor('message', (e) => e.message.convoId === gid && e.message.forwarded);
+      ok('the newest message can be forwarded into another chat', fwd.message.text === 'forward me please');
+      ok('forwarded copy records who sent it and who it came from', fwd.message.from === 'Alice' && fwd.message.forwardedFrom === 'Bob', JSON.stringify({ from: fwd.message.from, f: fwd.message.forwardedFrom }));
+      ok('the copy is a fresh message (own id, not a shared reference)', fwd.message.id !== src.id);
+      alice.send({ type: 'forward', messageId: src.id, fromConvoId: dmAB, toConvoIds: ['dm::Bob::Vera'] });
+      await sleep(250);
+      ok('forwarding into a chat you are not a member of is ignored', !alice.events.some((e) => e.type === 'message' && e.message.convoId === 'dm::Bob::Vera'));
+    }
+
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
     ok('messages.json persisted', fs.existsSync(path.join(dataDir, 'messages.json')));
@@ -943,6 +1120,7 @@ function makeWavDataUrl() {
     bob.close();
   } finally {
     server.kill('SIGTERM');
+    gifMock.close();
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);
