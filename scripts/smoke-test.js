@@ -12,7 +12,9 @@
  *   rejection, history persistence) → message deletes (ownership, tombstone,
  *   reactions wiped, edit/react-after-delete rejected) → group calls (multi-ring,
  *   partial decline, member added mid-call via call_add, leave lifecycle, call
- *   log) → oversized upload rejected → JSON persistence (with legacy
+ *   log) → privacy & Ghost Mode (per-setting toggles, hidden presence,
+ *   suppressed read receipts / typing / delivery, call gating, persistence) →
+ *   oversized upload rejected → JSON persistence (with legacy
  *   messages.json migration).
  *
  * Run: npm test   (or: node scripts/smoke-test.js)
@@ -27,6 +29,17 @@ const { WebSocket } = require('ws');
 
 const PORT = Number(process.env.TEST_PORT || 3777);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Poll until fn() returns truthy (used to wait for broadcasts that don't have
+// their own waitFor-able event shape).
+async function waitUntil(fn, timeout = 4000) {
+  const start = Date.now();
+  while (!fn()) {
+    if (Date.now() - start > timeout) return false;
+    await sleep(50);
+  }
+  return true;
+}
 
 let passed = 0;
 let failed = 0;
@@ -779,6 +792,131 @@ function makeWavDataUrl() {
     chloe.close();
     daveBack.close();
 
+    console.log('\n— privacy & ghost mode —');
+    const ghosty = new Client('Ghosty');
+    const watcher = new Client('Watcher');
+    await ghosty.connect();
+    await watcher.connect();
+    ghosty.send({ type: 'join', name: 'Ghosty' });
+    watcher.send({ type: 'join', name: 'Watcher' });
+    const jg = await ghosty.waitFor('joined');
+    await watcher.waitFor('joined');
+    const dmGW = 'dm::Ghosty::Watcher';
+
+    ok(
+      'joined payload carries default privacy (everything on, ghost off)',
+      jg.privacy && jg.privacy.ghost === false && jg.privacy.readReceipts === true &&
+        jg.privacy.lastSeen === true && jg.privacy.typing === true,
+      JSON.stringify(jg.privacy)
+    );
+
+    // read-receipts toggle
+    ghosty.send({ type: 'privacy_set', privacy: { readReceipts: false } });
+    await ghosty.waitFor('privacy_saved', (e) => e.privacy.readReceipts === false);
+    watcher.send({ type: 'message', convoId: dmGW, kind: 'text', text: 'receipts off test' });
+    await ghosty.waitFor('message', (e) => e.message.text === 'receipts off test');
+    let mark = watcher.events.length;
+    ghosty.send({ type: 'read', convoId: dmGW });
+    await sleep(300);
+    ok(
+      'read receipts suppressed while disabled',
+      !watcher.events.slice(mark).some((e) => e.type === 'status' && (e.readBy || []).includes('Ghosty'))
+    );
+    ghosty.send({ type: 'privacy_set', privacy: { readReceipts: true } });
+    await ghosty.waitFor('privacy_saved', (e) => e.privacy.readReceipts === true);
+    watcher.send({ type: 'message', convoId: dmGW, kind: 'text', text: 'receipts on test' });
+    const ron = await ghosty.waitFor('message', (e) => e.message.text === 'receipts on test');
+    ghosty.send({ type: 'read', convoId: dmGW });
+    await watcher.waitFor('status', (e) => e.id === ron.message.id && (e.readBy || []).includes('Ghosty'));
+    ok('read receipts flow again once re-enabled', true);
+
+    // typing toggle
+    ghosty.send({ type: 'privacy_set', privacy: { typing: false } });
+    await ghosty.waitFor('privacy_saved', (e) => e.privacy.typing === false);
+    mark = watcher.events.length;
+    ghosty.send({ type: 'typing', convoId: dmGW, isTyping: true });
+    await sleep(300);
+    ok(
+      'typing indicator hidden while disabled',
+      !watcher.events.slice(mark).some((e) => e.type === 'typing' && e.from === 'Ghosty')
+    );
+    ghosty.send({ type: 'privacy_set', privacy: { typing: true } });
+    await ghosty.waitFor('privacy_saved', (e) => e.privacy.typing === true);
+    mark = watcher.events.length;
+    ghosty.send({ type: 'typing', convoId: dmGW, isTyping: true });
+    await watcher.waitFor('typing', (e) => e.from === 'Ghosty');
+    ok('typing indicator visible again once enabled', true);
+
+    // last-seen toggle (needs the user to go offline)
+    ghosty.send({ type: 'privacy_set', privacy: { lastSeen: false } });
+    await ghosty.waitFor('privacy_saved', (e) => e.privacy.lastSeen === false);
+    ghosty.close();
+    mark = watcher.events.length;
+    const hiddenSeen = await waitUntil(() => watcher.events.slice(mark).some(
+      (e) => e.type === 'users' && e.users.some((u) => u.name === 'Ghosty' && u.online === false && u.lastSeen === null)
+    ));
+    ok('last seen hidden while disabled (offline contact shows no timestamp)', hiddenSeen);
+
+    // Ghost Mode
+    const ghostyBack = new Client('GhostyBack');
+    await ghostyBack.connect();
+    ghostyBack.send({ type: 'join', name: 'Ghosty' });
+    await ghostyBack.waitFor('joined');
+    mark = watcher.events.length;
+    ghostyBack.send({ type: 'privacy_set', privacy: { ghost: true } });
+    await ghostyBack.waitFor('privacy_saved', (e) => e.privacy.ghost === true);
+    const ghostOffline = await waitUntil(() => watcher.events.slice(mark).some(
+      (e) => e.type === 'users' && e.users.some((u) => u.name === 'Ghosty' && u.online === false)
+    ));
+    ok('ghost appears offline even while connected', ghostOffline);
+
+    // the ghost still receives messages live, but the sender never sees delivery
+    watcher.send({ type: 'message', convoId: dmGW, kind: 'text', text: 'to the ghost' });
+    const toGhost = await ghostyBack.waitFor('message', (e) => e.message.text === 'to the ghost');
+    ok('ghost still receives messages live', !!toGhost);
+    ok('ghost delivery hidden from the sender', (toGhost.message.deliveredBy || []).length === 0);
+
+    mark = watcher.events.length;
+    ghostyBack.send({ type: 'read', convoId: dmGW });
+    await sleep(300);
+    ok(
+      'ghost read receipts suppressed',
+      !watcher.events.slice(mark).some((e) => e.type === 'status' && (e.readBy || []).includes('Ghosty'))
+    );
+    mark = watcher.events.length;
+    ghostyBack.send({ type: 'typing', convoId: dmGW, isTyping: true });
+    await sleep(300);
+    ok(
+      'ghost typing suppressed',
+      !watcher.events.slice(mark).some((e) => e.type === 'typing' && e.from === 'Ghosty')
+    );
+
+    // ghost cannot be called (appears offline to callers)
+    watcher.send({ type: 'call_invite', convoId: dmGW });
+    const ghostCall = await watcher.waitFor('call_failed', (e) => e.convoId === dmGW);
+    ok('calling a ghost reports "offline"', ghostCall.reason === 'offline', JSON.stringify(ghostCall));
+
+    // ghost can still send messages
+    ghostyBack.send({ type: 'message', convoId: dmGW, kind: 'text', text: 'ghost says hi' });
+    await watcher.waitFor('message', (e) => e.message.text === 'ghost says hi');
+    ok('ghost can still send messages', true);
+
+    // turning ghost off restores presence
+    mark = watcher.events.length;
+    ghostyBack.send({ type: 'privacy_set', privacy: { ghost: false } });
+    await ghostyBack.waitFor('privacy_saved', (e) => e.privacy.ghost === false);
+    const ghostVisible = await waitUntil(() => watcher.events.slice(mark).some(
+      (e) => e.type === 'users' && e.users.some((u) => u.name === 'Ghosty' && u.online === true)
+    ));
+    ok('presence restored after leaving ghost mode', ghostVisible);
+
+    // leave a distinctive final state to verify persistence below
+    ghostyBack.send({ type: 'privacy_set', privacy: { readReceipts: false, lastSeen: false, typing: true, ghost: false } });
+    await ghostyBack.waitFor('privacy_saved', (e) => e.privacy.readReceipts === false && e.privacy.lastSeen === false);
+
+    ghostyBack.close();
+    watcher.close();
+
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
     ok('messages.json persisted', fs.existsSync(path.join(dataDir, 'messages.json')));
@@ -788,6 +926,12 @@ function makeWavDataUrl() {
     ok(
       'users.json persisted (Alice pic + bot avatars)',
       usersRaw.Alice && usersRaw.Alice.pic === up1.json.url && usersRaw.Aria.pic.endsWith('.svg') && usersRaw['DJ Nova'].pic.endsWith('.svg')
+    );
+    ok(
+      'privacy settings persisted per user',
+      usersRaw.Ghosty && usersRaw.Ghosty.privacy &&
+        usersRaw.Ghosty.privacy.readReceipts === false && usersRaw.Ghosty.privacy.lastSeen === false,
+      JSON.stringify(usersRaw.Ghosty && usersRaw.Ghosty.privacy)
     );
     ok('accounts.json persisted', fs.existsSync(path.join(dataDir, 'accounts.json')));
     const accountsRaw = JSON.parse(fs.readFileSync(path.join(dataDir, 'accounts.json'), 'utf8'));

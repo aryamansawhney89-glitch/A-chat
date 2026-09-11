@@ -49,11 +49,15 @@
         <div class="my-avatar-wrap" id="myAvatarWrap" title="Change your profile picture">
           <div class="avatar" id="myAvatar">?</div>
         </div>
-        <div class="me-name" id="myName"></div>
+        <div class="me-id">
+          <div class="me-name" id="myName"></div>
+          <span class="ghost-pill hidden" id="ghostPill" title="Ghost Mode is on — you appear offline">👻 Ghost</span>
+        </div>
         <div class="side-actions">
           <button id="newGroupBtn" class="icon-btn" title="New group">👥</button>
           <button id="newRoomBtn" class="icon-btn" title="New room">🔒</button>
           <button id="joinRoomBtn" class="icon-btn" title="Join room">🚪</button>
+          <button id="privacyBtn" class="icon-btn" title="Privacy & Ghost Mode">🛡️</button>
           <button id="themeBtn" class="icon-btn" title="Toggle dark mode">🌙</button>
           <button id="logoutBtn" class="icon-btn" title="Log out">⏻</button>
         </div>
@@ -287,6 +291,48 @@
         <div class="gm-label" id="chatInfoMembersLabel">Members</div>
         <div id="chatInfoMembers" class="ci-members"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- Privacy & Ghost Mode -->
+  <div id="privacyModal" class="modal-overlay hidden">
+    <div class="modal privacy-modal">
+      <header><span>🛡️ Privacy &amp; Ghost Mode</span><button id="privacyCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <label class="priv-row">
+          <span class="priv-body">
+            <span class="priv-title">👻 Ghost Mode</span>
+            <span class="priv-desc">Appear offline to everyone — hide your presence, typing and read receipts. You can still read and reply.</span>
+          </span>
+          <input type="checkbox" id="ghostToggle" class="switch" />
+        </label>
+        <div class="gm-label priv-section-label">Individual privacy</div>
+        <label class="priv-row">
+          <span class="priv-body">
+            <span class="priv-title">Read receipts</span>
+            <span class="priv-desc">Let others see when you've read their messages.</span>
+          </span>
+          <input type="checkbox" id="readReceiptsToggle" class="switch" />
+        </label>
+        <label class="priv-row">
+          <span class="priv-body">
+            <span class="priv-title">Last seen</span>
+            <span class="priv-desc">Let others see when you were last online.</span>
+          </span>
+          <input type="checkbox" id="lastSeenToggle" class="switch" />
+        </label>
+        <label class="priv-row">
+          <span class="priv-body">
+            <span class="priv-title">Typing indicator</span>
+            <span class="priv-desc">Let others see when you're typing.</span>
+          </span>
+          <input type="checkbox" id="typingToggle" class="switch" />
+        </label>
+        <p class="priv-note">These settings are saved per account on this server and survive refreshes and restarts.</p>
+      </div>
+      <footer>
+        <button id="privacyDoneBtn" class="btn primary">Done</button>
+      </footer>
     </div>
   </div>
 

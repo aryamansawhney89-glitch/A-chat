@@ -45,6 +45,13 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 - **Profile pictures 👤** — click your own avatar to upload (client-resized to 256px),
   persisted per user in `data/users.json` and broadcast to everyone; the three bots
   ship with SVG avatars
+- **Privacy & Ghost Mode 🛡️👻** — a per-account privacy panel (tap 🛡️ in the sidebar)
+  with three toggles — **read receipts**, **last seen** and **typing indicator** —
+  plus a one-tap **Ghost Mode** that makes you appear offline to everyone (your
+  presence, typing, delivery and read receipts are hidden, and callers see you as
+  offline — you can still read, reply and place calls). Settings persist per
+  account in `data/users.json` and survive restarts; a 👻 badge shows next to your
+  name while ghosting
 - **Typing indicators** and **online / last-seen presence** (per chat and per member in groups)
 - **Unread badges** (sidebar + browser tab title)
 - **Emoji picker**, auto-growing composer, Enter-to-send
@@ -109,7 +116,10 @@ Start `npm start`, Plan **Free** → **Deploy**.
   participants), `grp::<id>` (group), or `room::<id>` (password-protected room).
   Presence, typing and per-member delivered/read receipts (`deliveredBy` / `readBy`
   arrays) travel as JSON frames; history, groups, profiles, reactions, accounts and
-  rooms are kept in memory and flushed to JSON files in `data/`. Passwords are hashed
+  rooms are kept in memory and flushed to JSON files in `data/`. Each profile carries
+  a `privacy` object (`readReceipts`, `lastSeen`, `typing`, `ghost`) — the server
+  enforces them server-side (a ghost user is reported offline, and their typing,
+  delivery and read receipts are never emitted to others). Passwords are hashed
   with PBKDF2 (10,000 iterations, SHA-512). Uploaded media is written to `data/uploads`
   and served at `/uploads`. Calls never touch media on the server — only SDP/ICE
   signalling is relayed between participants, and each call is logged as a `kind:"call"`
