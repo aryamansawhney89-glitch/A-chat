@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>A-Chat</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💬</text></svg>" />
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=__BUILD__" />
 </head>
 <body>
   <div class="top-strip"></div>
@@ -29,6 +29,7 @@
         <p class="auth-links"><a href="#" id="forgotLink">Forgot password?</a> &nbsp;|&nbsp; <a href="#" id="show2FALink">Have a 2FA code?</a></p>
       </div>
       <p class="join-hint">Your account is stored on this server. Create one to get started!</p>
+      <p class="join-hint" style="opacity:.6;font-size:11px">A-Chat v__VERSION__ · build __BUILD__</p>
     </div>
   </div>
 
@@ -553,6 +554,7 @@
   <input type="file" id="groupPicInput" accept="image/*" hidden />
   <input type="file" id="statusPhotoInput" accept="image/*" hidden />
 
-  <script src="app.js"></script>
+  <script>window.APP_BUILD="__BUILD__";window.APP_VERSION="__VERSION__";</script>
+  <script src="app.js?v=__BUILD__"></script>
 </body>
 </html>

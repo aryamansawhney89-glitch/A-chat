@@ -1991,7 +1991,26 @@ function handle(ws, msg) {
 /* --------------------------------- server --------------------------------- */
 
 const app = express();
-app.use(express.static(path.join(__dirname, 'public')));
+const APP_VERSION = require('./package.json').version;
+const BUILD_ID = process.env.RENDER_GIT_COMMIT ? process.env.RENDER_GIT_COMMIT.slice(0, 7) : String(Date.now());
+
+// Never let browsers/CDNs hold on to a stale UI: HTML/JS/CSS are always revalidated,
+// and index.html gets the current build id injected so it's easy to see what's live.
+app.use((req, res, next) => {
+  if (/\.(html|js|css)$/.test(req.path) || req.path === '/') {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  next();
+});
+const INDEX_PATH = path.join(__dirname, 'public', 'index.html');
+app.get(['/', '/index.html'], (_req, res) => {
+  let html = fs.readFileSync(INDEX_PATH, 'utf8');
+  html = html.replace(/__BUILD__/g, BUILD_ID).replace(/__VERSION__/g, APP_VERSION);
+  res.type('html').send(html);
+});
+app.use(express.static(path.join(__dirname, 'public'), { etag: false, lastModified: false, cacheControl: false }));
 app.use('/uploads', express.static(UPLOADS_DIR, {
   maxAge: '1d',
   setHeaders(res, filePath) {
@@ -2000,7 +2019,8 @@ app.use('/uploads', express.static(UPLOADS_DIR, {
     res.setHeader('Accept-Ranges', 'bytes');
   },
 }));
-app.get('/healthz', (_req, res) => res.json({ ok: true, users: clients.size }));
+app.get('/healthz', (_req, res) => res.json({ ok: true, users: clients.size, version: APP_VERSION, build: BUILD_ID }));
+app.get('/api/version', (_req, res) => res.json({ version: APP_VERSION, build: BUILD_ID }));
 app.get('/sw.js', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'sw.js')));
 
 // export data

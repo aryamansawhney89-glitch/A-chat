@@ -8,3 +8,5 @@ services:
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /healthz
+    autoDeploy: true
+    branch: main
