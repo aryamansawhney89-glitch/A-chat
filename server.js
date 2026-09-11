@@ -185,6 +185,44 @@ const newGroupId = () => `grp::${crypto.randomBytes(4).toString('hex')}`;
 const newRoomId = () => `room::${crypto.randomBytes(4).toString('hex')}`;
 const newInviteCode = () => crypto.randomBytes(3).toString('hex').toUpperCase(); // 6-char code
 
+/* --------------------------- privacy & ghost mode -------------------------- */
+
+// Per-account privacy flags, persisted on each profile (data/users.json):
+//   readReceipts — let others see when you've read their messages
+//   lastSeen     — let others see when you were last online
+//   typing       — let others see when you're typing
+//   ghost        — Ghost Mode: appear offline everywhere (overrides the rest)
+const DEFAULT_PRIVACY = { readReceipts: true, lastSeen: true, typing: true, ghost: false };
+
+function normalizePrivacy(p) {
+  const out = { ...DEFAULT_PRIVACY };
+  if (p && typeof p === 'object') {
+    for (const k of Object.keys(out)) {
+      if (typeof p[k] === 'boolean') out[k] = p[k];
+    }
+  }
+  return out;
+}
+
+// Fetch (and create) a profile with a normalised privacy object.
+function profileFor(name) {
+  let p = profiles.get(name);
+  if (!p) {
+    p = { name, pic: null, about: '', privacy: { ...DEFAULT_PRIVACY } };
+    profiles.set(name, p);
+  } else {
+    p.privacy = normalizePrivacy(p.privacy);
+  }
+  return p;
+}
+
+function privacyOf(name) {
+  const p = profiles.get(name);
+  return p && p.privacy ? normalizePrivacy(p.privacy) : { ...DEFAULT_PRIVACY };
+}
+
+const isGhost = (name) => privacyOf(name).ghost === true;
+
 /* ---------------------------- password helpers ---------------------------- */
 
 function hashPassword(password, salt) {
@@ -272,7 +310,12 @@ function loadState() {
     const raw = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
     for (const [name, p] of Object.entries(raw)) {
       if (p && typeof p === 'object') {
-        profiles.set(name, { name, pic: p.pic || null, about: p.about || '' });
+        profiles.set(name, {
+          name,
+          pic: p.pic || null,
+          about: p.about || '',
+          privacy: normalizePrivacy(p.privacy),
+        });
       }
     }
   } catch { /* no profiles yet */ }
@@ -299,7 +342,7 @@ function loadState() {
   // make sure the bots always have their avatars + about text
   for (const b of BOTS) {
     const existing = profiles.get(b.name);
-    if (!existing) profiles.set(b.name, { name: b.name, pic: BOT_AVATARS[b.name], about: b.subtitle });
+    if (!existing) profiles.set(b.name, { name: b.name, pic: BOT_AVATARS[b.name], about: b.subtitle, privacy: { ...DEFAULT_PRIVACY } });
     else if (!existing.pic) existing.pic = BOT_AVATARS[b.name];
   }
 
@@ -348,6 +391,7 @@ function notifyStatus(m) {
 }
 
 function markDeliveredFor(name) {
+  if (isGhost(name)) return; // ghost users never reveal delivery to senders
   let changed = false;
   for (const msgs of conversations.values()) {
     for (const m of msgs) {
@@ -363,12 +407,16 @@ function markDeliveredFor(name) {
 
 function userInfo(name) {
   const p = profiles.get(name) || {};
-  const online = clients.has(name);
+  const priv = privacyOf(name);
+  // Ghost Mode hides presence entirely; a hidden last-seen preference also
+  // clears the "last seen" hint that offline contacts would otherwise show.
+  const online = clients.has(name) && !priv.ghost;
+  const showLastSeen = !priv.ghost && priv.lastSeen;
   return {
     name,
     online,
     bot: isBot(name),
-    lastSeen: online ? null : lastSeen.get(name) || null,
+    lastSeen: online || !showLastSeen ? null : lastSeen.get(name) || null,
     pic: p.pic || null,
     about: p.about || '',
   };
@@ -521,7 +569,7 @@ function botSay(convoId, botName, text) {
   for (const p of convoParticipants(convoId)) {
     if (p === botName) continue;
     if (isBot(p)) { m.deliveredBy.push(p); m.readBy.push(p); }
-    else if (clients.has(p)) m.deliveredBy.push(p);
+    else if (clients.has(p) && !isGhost(p)) m.deliveredBy.push(p);
   }
   pushMessage(m);
   for (const p of convoParticipants(convoId)) {
@@ -622,7 +670,7 @@ function logCallMessage(call, status, duration) {
   for (const p of convoParticipants(call.convoId)) {
     if (p === call.initiator) continue;
     if (isBot(p)) { m.deliveredBy.push(p); m.readBy.push(p); }
-    else if (clients.has(p)) m.deliveredBy.push(p);
+    else if (clients.has(p) && !isGhost(p)) m.deliveredBy.push(p);
   }
   pushMessage(m);
   for (const p of convoParticipants(call.convoId)) {
@@ -699,7 +747,7 @@ function startCall(ws, msg) {
     send(ws, { type: 'call_failed', convoId, reason: 'nobody' });
     return;
   }
-  const online = targets.filter((n) => clients.has(n));
+  const online = targets.filter((n) => clients.has(n) && !isGhost(n));
   if (!online.length) {
     send(ws, { type: 'call_failed', convoId, reason: 'offline' });
     return;
@@ -811,11 +859,18 @@ function handle(ws, msg) {
       ws.userName = name;
       clients.set(name, ws);
       lastSeen.set(name, Date.now());
-      if (!profiles.has(name)) {
-        profiles.set(name, { name, pic: null, about: '' });
-        scheduleSave();
-      }
-      send(ws, { type: 'joined', name, users: userList(), groups: groupsForUser(name), rooms: roomsForUser(name), hasAccount: accounts.has(name.toLowerCase()) });
+      const isNewProfile = !profiles.has(name);
+      profileFor(name); // creates the profile (or normalises privacy) if needed
+      if (isNewProfile) scheduleSave();
+      send(ws, {
+        type: 'joined',
+        name,
+        users: userList(),
+        groups: groupsForUser(name),
+        rooms: roomsForUser(name),
+        hasAccount: accounts.has(name.toLowerCase()),
+        privacy: profileFor(name).privacy,
+      });
       broadcastUsers();
       markDeliveredFor(name);
       const key = dmConvoId(name, 'Aria');
@@ -862,8 +917,12 @@ function handle(ws, msg) {
         if (p === from || isBot(p)) continue;
         const target = clients.get(p);
         if (target && target.readyState === WebSocket.OPEN) {
-          m.deliveredBy.push(p);
-          changed = true;
+          // Ghost users still receive the message live, but the sender never
+          // learns it was delivered — they appear offline end to end.
+          if (!isGhost(p)) {
+            m.deliveredBy.push(p);
+            changed = true;
+          }
           send(target, { type: 'message', message: m });
         }
       }
@@ -881,6 +940,7 @@ function handle(ws, msg) {
       const from = ws.userName;
       const convoId = String(msg.convoId || '');
       if (!from || !canAccess(convoId, from)) return;
+      if (isGhost(from) || !privacyOf(from).typing) return; // privacy: don't reveal typing
       for (const p of convoParticipants(convoId)) {
         if (p !== from && !isBot(p)) {
           send(clients.get(p), { type: 'typing', convoId, from, isTyping: !!msg.isTyping });
@@ -893,6 +953,7 @@ function handle(ws, msg) {
       const me = ws.userName;
       const convoId = String(msg.convoId || '');
       if (!me || !canAccess(convoId, me)) return;
+      if (isGhost(me) || !privacyOf(me).readReceipts) return; // privacy: never send read receipts
       const msgs = conversations.get(convoId) || [];
       let changed = false;
       for (const m of msgs) {
@@ -955,12 +1016,30 @@ function handle(ws, msg) {
         send(ws, { type: 'error', error: 'Invalid profile picture.' });
         return;
       }
-      const p = profiles.get(from) || { name: from, pic: null, about: '' };
+      const p = profileFor(from);
       p.pic = pic;
       profiles.set(from, p);
       scheduleSave();
       send(ws, { type: 'profile_saved', pic });
       broadcastUsers();
+      break;
+    }
+
+    // Update per-user privacy toggles and Ghost Mode. Stored on the profile
+    // (persisted to users.json) so settings survive restarts and re-joins.
+    case 'privacy_set': {
+      const from = ws.userName;
+      if (!from) return;
+      if (!msg.privacy || typeof msg.privacy !== 'object') return;
+      const p = profileFor(from);
+      const current = normalizePrivacy(p.privacy);
+      for (const k of Object.keys(current)) {
+        if (typeof msg.privacy[k] === 'boolean') current[k] = msg.privacy[k];
+      }
+      p.privacy = current;
+      scheduleSave();
+      send(ws, { type: 'privacy_saved', privacy: current });
+      broadcastUsers(); // presence / last-seen changed — refresh everyone's list
       break;
     }
 
@@ -1074,7 +1153,7 @@ function handle(ws, msg) {
         if (!name || isBot(name)) continue;
         if (!convoParticipants(call.convoId).includes(name)) continue;
         if (call.joined.includes(name) || call.ringing.has(name) || call.declined.has(name)) continue;
-        if (!clients.has(name) || userInCall(name)) continue;
+        if (!clients.has(name) || isGhost(name) || userInCall(name)) continue;
         if (callMembers(call).size >= CALL_MAX_MEMBERS) break;
         call.ringing.add(name);
         added.push(name);
@@ -1127,7 +1206,7 @@ function handle(ws, msg) {
       accounts.set(key, account);
       // create profile if not exists
       if (!profiles.has(username)) {
-        profiles.set(username, { name: username, pic: null, about: '' });
+        profileFor(username);
       }
       // create session
       const token = newSessionToken();

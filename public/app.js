@@ -55,6 +55,7 @@ const state = {
   replyTo: null,        // message being replied to (composer quote bar)
   editing: null,        // {convoId, id} of the message being edited
   lastDateLabel: null,
+  privacy: { readReceipts: true, lastSeen: true, typing: true, ghost: false },
 };
 
 const AVATAR_COLORS = ['#00a884', '#0088cc', '#8e44ad', '#e67e22', '#e91e63', '#16a085', '#c0392b', '#2c3e50'];
@@ -197,6 +198,13 @@ function myPic() {
 
 function wsSend(payload) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(payload));
+}
+
+// Read receipts: skipped entirely when Ghost Mode or the read-receipt toggle is
+// off. The server enforces the same rule; this just avoids pointless traffic.
+function sendRead(convoId) {
+  if (state.privacy.ghost || !state.privacy.readReceipts) return;
+  wsSend({ type: 'read', convoId });
 }
 
 function connect() {
@@ -365,10 +373,22 @@ function handle(msg) {
       state.users = msg.users || [];
       state.groups = new Map((msg.groups || []).map((g) => [g.id, g]));
       state.rooms = new Map((msg.rooms || []).map((r) => [r.id, r]));
+      if (msg.privacy && typeof msg.privacy === 'object') {
+        state.privacy = { ...state.privacy, ...msg.privacy };
+      }
       joinScreen.classList.add('hidden');
       app.classList.remove('hidden');
       renderMe();
+      syncPrivacyUI();
       renderChatList();
+      break;
+    }
+
+    case 'privacy_saved': {
+      if (msg.privacy && typeof msg.privacy === 'object') {
+        state.privacy = { ...state.privacy, ...msg.privacy };
+      }
+      syncPrivacyUI();
       break;
     }
 
@@ -415,7 +435,7 @@ function handle(msg) {
         appendMessage(m, prev);
         maybeScroll(m);
         if (m.from !== state.me && document.hasFocus()) {
-          wsSend({ type: 'read', convoId: m.convoId });
+          sendRead(m.convoId);
         } else if (m.from !== state.me) {
           chat.unread++;
         }
@@ -437,7 +457,7 @@ function handle(msg) {
       chat.lastTs = chat.messages.length ? chat.messages[chat.messages.length - 1].ts : 0;
       if (state.active === msg.convoId) {
         renderMessages(chat);
-        wsSend({ type: 'read', convoId: msg.convoId });
+        sendRead(msg.convoId);
         chat.unread = 0;
         renderChatList();
         updateTitleBadge();
@@ -816,7 +836,7 @@ function openChat(convoId) {
   chat.unread = 0;
   if (chat.messages.length) {
     renderMessages(chat);
-    wsSend({ type: 'read', convoId });
+    sendRead(convoId);
   } else {
     messagesEl.innerHTML = '';
     state.lastDateLabel = null;
@@ -1503,6 +1523,7 @@ let lastTypingSent = 0;
 let typingStopTimer = null;
 function sendTyping(isTyping) {
   if (!state.active) return;
+  if (state.privacy.ghost || !state.privacy.typing) return; // privacy: no typing leaks
   const now = Date.now();
   if (isTyping) {
     if (now - lastTypingSent > 1800) {
@@ -2699,6 +2720,69 @@ logoutBtn.addEventListener('click', () => {
 
 backBtn.addEventListener('click', () => document.body.classList.remove('chat-open'));
 
+/* ------------------------------ privacy & ghost mode ----------------------- */
+
+const privacyBtn = $('privacyBtn');
+const privacyModal = $('privacyModal');
+const privacyCloseBtn = $('privacyCloseBtn');
+const privacyDoneBtn = $('privacyDoneBtn');
+const ghostToggle = $('ghostToggle');
+const readReceiptsToggle = $('readReceiptsToggle');
+const lastSeenToggle = $('lastSeenToggle');
+const typingToggle = $('typingToggle');
+const ghostPill = $('ghostPill');
+
+function syncPrivacyUI() {
+  ghostToggle.checked = !!state.privacy.ghost;
+  readReceiptsToggle.checked = !!state.privacy.readReceipts;
+  lastSeenToggle.checked = !!state.privacy.lastSeen;
+  typingToggle.checked = !!state.privacy.typing;
+  // Ghost Mode overrides the three fine-grained toggles — grey them out but
+  // keep their values so they snap back when Ghost Mode is turned off.
+  const overridden = !!state.privacy.ghost;
+  readReceiptsToggle.disabled = overridden;
+  lastSeenToggle.disabled = overridden;
+  typingToggle.disabled = overridden;
+  ghostPill.classList.toggle('hidden', !state.privacy.ghost);
+}
+
+function readPrivacyUI() {
+  return {
+    ghost: ghostToggle.checked,
+    readReceipts: readReceiptsToggle.checked,
+    lastSeen: lastSeenToggle.checked,
+    typing: typingToggle.checked,
+  };
+}
+
+function pushPrivacy() {
+  const wasGhost = !!state.privacy.ghost;
+  state.privacy = readPrivacyUI();
+  syncPrivacyUI();
+  if (state.privacy.ghost !== wasGhost) {
+    toast(state.privacy.ghost ? '👻 Ghost Mode on — you now appear offline' : 'Ghost Mode off — you are visible again');
+  } else {
+    toast('Privacy updated 🛡️');
+  }
+  wsSend({ type: 'privacy_set', privacy: state.privacy });
+}
+
+function openPrivacyModal() {
+  syncPrivacyUI();
+  privacyModal.classList.remove('hidden');
+}
+
+function closePrivacyModal() {
+  privacyModal.classList.add('hidden');
+}
+
+privacyBtn.addEventListener('click', openPrivacyModal);
+privacyCloseBtn.addEventListener('click', closePrivacyModal);
+privacyDoneBtn.addEventListener('click', closePrivacyModal);
+[ghostToggle, readReceiptsToggle, lastSeenToggle, typingToggle].forEach((t) => {
+  t.addEventListener('change', pushPrivacy);
+});
+
 /* ------------------------------ misc --------------------------------------- */
 
 function updateTitleBadge() {
@@ -2715,7 +2799,7 @@ window.addEventListener('focus', () => {
       renderChatList();
       updateTitleBadge();
     }
-    wsSend({ type: 'read', convoId: state.active });
+    sendRead(state.active);
   }
 });
 
@@ -2869,6 +2953,7 @@ document.addEventListener('keydown', (e) => {
     closeReactionPicker();
     closeChatInfo();
     closeAddToCallModal();
+    closePrivacyModal();
     cancelMessageAction(false); // cancel a pending reply / edit
   }
 });
