@@ -23,8 +23,10 @@
       <div id="authForm">
         <input id="authUsername" maxlength="24" placeholder="Username" autocomplete="username" />
         <input id="authPassword" type="password" maxlength="64" placeholder="Password" autocomplete="current-password" />
+        <input id="authOtp" maxlength="6" placeholder="2FA code (if enabled)" class="hidden" autocomplete="one-time-code" />
         <p id="authError" class="auth-error hidden"></p>
         <button id="authSubmitBtn">Log in</button>
+        <p class="auth-links"><a href="#" id="forgotLink">Forgot password?</a> &nbsp;|&nbsp; <a href="#" id="show2FALink">Have a 2FA code?</a></p>
       </div>
       <p class="join-hint">Your account is stored on this server. Create one to get started!</p>
     </div>
@@ -54,19 +56,39 @@
           <span class="ghost-pill hidden" id="ghostPill" title="Ghost Mode is on — you appear offline">👻 Ghost</span>
         </div>
         <div class="side-actions">
+          <button id="statusBtn" class="icon-btn" title="Status stories">⭕</button>
           <button id="newGroupBtn" class="icon-btn" title="New group">👥</button>
           <button id="newRoomBtn" class="icon-btn" title="New room">🔒</button>
           <button id="joinRoomBtn" class="icon-btn" title="Join room">🚪</button>
           <button id="privacyBtn" class="icon-btn" title="Privacy & Ghost Mode">🛡️</button>
+          <button id="accountBtn" class="icon-btn" title="Account & 2FA">⚙️</button>
           <button id="themeBtn" class="icon-btn" title="Toggle dark mode">🌙</button>
+          <button id="notifBtn" class="icon-btn" title="Enable notifications">🔔</button>
+          <button id="wallpaperBtn" class="icon-btn" title="Wallpaper & themes">🎨</button>
           <button id="logoutBtn" class="icon-btn" title="Log out">⏻</button>
         </div>
       </header>
+      <!-- Status stories bar -->
+      <div id="statusBar" class="status-bar">
+        <div class="status-item add-status" id="addStatusBtn" title="Add status">
+          <div class="status-avatar">+</div><span class="status-name">My status</span>
+        </div>
+        <div id="statusList" class="status-list"></div>
+      </div>
       <div class="search-box">
-        <input id="searchInput" placeholder="Search or start new chat" autocomplete="off" />
+        <input id="searchInput" placeholder="Search chats or messages" autocomplete="off" />
+        <button id="globalSearchBtn" class="icon-btn" title="Search messages" style="width:30px;height:30px;font-size:14px">🔍</button>
+      </div>
+      <div class="filter-bar" id="filterBar">
+        <button class="filter-chip active" data-filter="all">All</button>
+        <button class="filter-chip" data-filter="unread">Unread</button>
+        <button class="filter-chip" data-filter="mentions">@Mentions</button>
+        <button class="filter-chip" data-filter="pinned">📌 Pinned</button>
+        <button class="filter-chip" data-filter="starred">⭐ Starred</button>
       </div>
       <div class="conn-banner hidden" id="connBanner">Reconnecting…</div>
       <div class="chat-list" id="chatList"></div>
+      <div id="searchResults" class="search-results hidden"></div>
     </aside>
 
     <main class="chat-pane" id="chatPane">
@@ -85,15 +107,39 @@
             <div class="chat-title" id="chatTitle"></div>
             <div class="chat-status" id="chatStatus"></div>
           </div>
+          <button id="pinChatBtn" class="icon-btn" title="Pin chat">📌</button>
+          <button id="clearChatBtn" class="icon-btn" title="Clear chat">🧹</button>
+          <button id="disappearingBtn" class="icon-btn" title="Disappearing messages">⏳</button>
+          <button id="headerSearchBtn" class="icon-btn" title="Search in chat">🔍</button>
+          <button id="forwardHeaderBtn" class="icon-btn" title="Forward">↗️</button>
           <button id="videoCallBtn" class="icon-btn call-btn hidden" title="Video call">
             <svg viewBox="0 0 24 24" width="23" height="23"><path fill="currentColor" d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4Z"/></svg>
           </button>
           <button id="callBtn" class="icon-btn call-btn hidden" title="Voice call">
             <svg viewBox="0 0 24 24" width="21" height="21"><path fill="currentColor" d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.2.4 2.4.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.6 21 3 13.4 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.4 0 .8-.2 1l-2.3 2.2Z"/></svg>
           </button>
+          <button id="chatMenuBtn" class="icon-btn" title="More">⋮</button>
         </header>
+        <div class="chat-header-search hidden" id="chatSearchBar">
+          <input id="chatSearchInput" placeholder="Search in this chat" autocomplete="off" />
+          <button id="chatSearchClose" class="icon-btn" title="Close">✕</button>
+        </div>
         <div class="messages" id="messages"></div>
-        <div class="emoji-panel hidden" id="emojiPanel"></div>
+        <div class="emoji-panel hidden" id="emojiPanel">
+          <div class="emoji-tabs">
+            <button class="emoji-tab active" data-tab="emoji">😊</button>
+            <button class="emoji-tab" data-tab="gif">GIF</button>
+            <button class="emoji-tab" data-tab="sticker">Sticker</button>
+          </div>
+          <div id="emojiTabContent" class="emoji-tab-content"></div>
+          <div id="gifTabContent" class="gif-tab-content hidden">
+            <input id="gifSearch" placeholder="Search GIFs" autocomplete="off" />
+            <div id="gifGrid" class="gif-grid"></div>
+          </div>
+          <div id="stickerTabContent" class="sticker-tab-content hidden">
+            <div id="stickerGrid" class="sticker-grid"></div>
+          </div>
+        </div>
         <div class="composer-area">
           <div id="replyBar" class="reply-bar hidden">
             <span class="rb-accent"></span>
@@ -106,6 +152,8 @@
           <footer class="composer" id="composerBar">
             <button id="emojiBtn" class="icon-btn" title="Emoji">😊</button>
             <button id="attachBtn" class="icon-btn" title="Send photo">📎</button>
+            <button id="stickerBtn" class="icon-btn" title="Stickers & GIFs">🎭</button>
+            <button id="pollBtn" class="icon-btn" title="Create poll">📊</button>
             <textarea id="msgInput" rows="1" placeholder="Type a message"></textarea>
             <button id="sendBtn" class="send-btn hidden" title="Send">
               <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M2.7 11.2 21.3 2.1c.6-.3 1.2.3 1 .9l-8.2 18.6c-.3.6-1.2.6-1.4-.1l-2-6.6c-.1-.3-.3-.5-.6-.6l-6.8-1.7c-.6-.2-.7-1.1-.1-1.4Z"/></svg>
@@ -166,6 +214,8 @@
         <input id="roomNameInput" maxlength="50" placeholder="e.g. Secret Club" autocomplete="off" />
         <label class="rm-label">Password</label>
         <input id="roomPasswordInput" type="password" maxlength="64" placeholder="Set a password for this room" />
+        <label class="rm-label">Retention (days, 0 = forever)</label>
+        <input id="roomRetentionInput" type="number" min="0" max="30" placeholder="0" value="0" />
         <p class="rm-hint">Anyone with the password or an invite code can join and chat.</p>
       </div>
       <footer>
@@ -194,7 +244,7 @@
     </div>
   </div>
 
-  <!-- Room invite card (shown after room creation) -->
+  <!-- Room invite card -->
   <div id="roomInviteModal" class="modal-overlay hidden">
     <div class="modal invite-modal">
       <header><span>🔒 Room created!</span><button id="inviteCloseBtn" class="icon-btn" title="Close">✕</button></header>
@@ -208,6 +258,149 @@
       <footer>
         <button id="inviteDoneBtn" class="btn primary">Done</button>
       </footer>
+    </div>
+  </div>
+
+  <!-- Poll creation modal -->
+  <div id="pollModal" class="modal-overlay hidden">
+    <div class="modal poll-modal">
+      <header><span>📊 Create poll</span><button id="pollCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <input id="pollQuestion" maxlength="200" placeholder="Ask a question" autocomplete="off" />
+        <div id="pollOptions" class="poll-options">
+          <input class="poll-opt" maxlength="80" placeholder="Option 1" />
+          <input class="poll-opt" maxlength="80" placeholder="Option 2" />
+          <input class="poll-opt" maxlength="80" placeholder="Option 3 (optional)" />
+          <input class="poll-opt" maxlength="80" placeholder="Option 4 (optional)" />
+        </div>
+        <label class="priv-row" style="border:none;padding:8px 0"><input type="checkbox" id="pollMultiple" /> <span style="margin-left:8px">Allow multiple answers</span></label>
+      </div>
+      <footer>
+        <button id="pollCancelBtn" class="btn">Cancel</button>
+        <button id="pollCreateBtn" class="btn primary">Send poll</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Forward modal -->
+  <div id="forwardModal" class="modal-overlay hidden">
+    <div class="modal forward-modal">
+      <header><span>Forward to…</span><button id="forwardCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <div id="forwardList" class="gm-members"></div>
+      </div>
+      <footer>
+        <button id="forwardCancelBtn" class="btn">Cancel</button>
+        <button id="forwardSendBtn" class="btn primary">Forward</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Disappearing messages modal -->
+  <div id="disappearingModal" class="modal-overlay hidden">
+    <div class="modal disappearing-modal">
+      <header><span>⏳ Disappearing messages</span><button id="disappearingCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <p class="priv-desc">Messages will auto-delete after the timer.</p>
+        <div class="disappearing-options">
+          <label><input type="radio" name="disappearing" value="0" checked /> Off</label>
+          <label><input type="radio" name="disappearing" value="5" /> 5 seconds</label>
+          <label><input type="radio" name="disappearing" value="30" /> 30 seconds</label>
+          <label><input type="radio" name="disappearing" value="60" /> 1 minute</label>
+          <label><input type="radio" name="disappearing" value="300" /> 5 minutes</label>
+          <label><input type="radio" name="disappearing" value="3600" /> 1 hour</label>
+          <label><input type="radio" name="disappearing" value="86400" /> 24 hours</label>
+        </div>
+      </div>
+      <footer>
+        <button id="disappearingCancelBtn" class="btn">Cancel</button>
+        <button id="disappearingSaveBtn" class="btn primary">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Status create modal -->
+  <div id="statusCreateModal" class="modal-overlay hidden">
+    <div class="modal status-create-modal">
+      <header><span>⭕ New status</span><button id="statusCreateCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <textarea id="statusText" rows="3" maxlength="500" placeholder="What's on your mind? (24h)"></textarea>
+        <div class="status-media-row">
+          <button id="statusPhotoBtn" class="btn">📸 Add photo</button>
+          <span id="statusPhotoName" class="priv-desc"></span>
+        </div>
+      </div>
+      <footer>
+        <button id="statusCreateCancelBtn" class="btn">Cancel</button>
+        <button id="statusCreateSendBtn" class="btn primary">Share</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Status viewer -->
+  <div id="statusViewer" class="status-viewer hidden">
+    <div class="status-viewer-header">
+      <div class="avatar" id="statusViewerAvatar">?</div>
+      <div class="status-viewer-meta"><div id="statusViewerName"></div><div id="statusViewerTime"></div></div>
+      <button id="statusViewerClose" class="icon-btn" title="Close">✕</button>
+    </div>
+    <div class="status-viewer-body" id="statusViewerBody"></div>
+    <div class="status-viewer-footer"><span id="statusViewerViews"></span></div>
+  </div>
+
+  <!-- Wallpaper modal -->
+  <div id="wallpaperModal" class="modal-overlay hidden">
+    <div class="modal wallpaper-modal">
+      <header><span>🎨 Chat wallpaper</span><button id="wallpaperCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <div class="gm-label">Pick a wallpaper</div>
+        <div id="wallpaperGrid" class="wallpaper-grid"></div>
+      </div>
+      <footer>
+        <button id="wallpaperDoneBtn" class="btn primary">Done</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Starred messages modal -->
+  <div id="starredModal" class="modal-overlay hidden">
+    <div class="modal starred-modal">
+      <header><span>⭐ Starred messages</span><button id="starredCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body" id="starredList"></div>
+      <footer><button id="starredDoneBtn" class="btn primary">Close</button></footer>
+    </div>
+  </div>
+
+  <!-- Account & 2FA modal -->
+  <div id="accountModal" class="modal-overlay hidden">
+    <div class="modal account-modal">
+      <header><span>⚙️ Account</span><button id="accountCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <div class="gm-label">Two-factor authentication (2FA)</div>
+        <div id="twoFAStatus" class="priv-desc">Loading…</div>
+        <button id="enable2FABtn" class="btn">Enable 2FA</button>
+        <button id="disable2FABtn" class="btn hidden">Disable 2FA</button>
+        <div id="twoFASecretWrap" class="hidden">
+          <p class="priv-desc">Secret: <b id="twoFASecret"></b></p>
+          <input id="twoFACode" maxlength="6" placeholder="Enter 6-digit code" />
+          <button id="verify2FABtn" class="btn primary">Verify & enable</button>
+        </div>
+        <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)" />
+        <div class="gm-label">Export your data</div>
+        <button id="exportDataBtn" class="btn">📥 Download my data (JSON)</button>
+        <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)" />
+        <div class="gm-label">Danger zone</div>
+        <input id="deleteConfirmPw" type="password" placeholder="Enter password to delete account" />
+        <button id="deleteAccountBtn" class="btn" style="background:#e53935;color:#fff">🗑️ Delete account</button>
+        <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)" />
+        <div class="gm-label">Password reset (demo)</div>
+        <button id="requestResetBtn" class="btn">Request reset token</button>
+        <p id="resetTokenDisplay" class="priv-desc hidden"></p>
+        <input id="resetTokenInput" placeholder="Paste token" class="hidden" />
+        <input id="resetNewPw" type="password" placeholder="New password" class="hidden" />
+        <button id="doResetBtn" class="btn primary hidden">Reset password</button>
+      </div>
+      <footer><button id="accountDoneBtn" class="btn primary">Done</button></footer>
     </div>
   </div>
 
@@ -273,7 +466,7 @@
     </div>
   </div>
 
-  <!-- Group / room info (tap the chat title) -->
+  <!-- Group / room info -->
   <div id="chatInfoModal" class="modal-overlay hidden">
     <div class="modal chat-info-modal">
       <header><span id="chatInfoKind">Group info</span><button id="chatInfoCloseBtn" class="icon-btn" title="Close">✕</button></header>
@@ -290,6 +483,10 @@
         </div>
         <div class="gm-label" id="chatInfoMembersLabel">Members</div>
         <div id="chatInfoMembers" class="ci-members"></div>
+        <div class="ci-admin-actions hidden" id="adminActions">
+          <div class="gm-label">Admin actions</div>
+          <button id="addMemberBtn" class="btn">Add member</button>
+        </div>
       </div>
     </div>
   </div>
@@ -336,6 +533,15 @@
     </div>
   </div>
 
+  <!-- Add member modal (admin) -->
+  <div id="addMemberModal" class="modal-overlay hidden">
+    <div class="modal">
+      <header><span>Add member</span><button id="addMemberCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body"><div id="addMemberList" class="gm-members"></div></div>
+      <footer><button id="addMemberCancelBtn" class="btn">Cancel</button><button id="addMemberAddBtn" class="btn primary">Add</button></footer>
+    </div>
+  </div>
+
   <!-- Photo lightbox -->
   <div id="lightbox" class="lightbox hidden"><img id="lightboxImg" alt="Photo" /></div>
 
@@ -344,6 +550,7 @@
   <input type="file" id="photoInput" accept="image/*" hidden />
   <input type="file" id="avatarInput" accept="image/*" hidden />
   <input type="file" id="groupPicInput" accept="image/*" hidden />
+  <input type="file" id="statusPhotoInput" accept="image/*" hidden />
 
   <script src="app.js"></script>
 </body>
