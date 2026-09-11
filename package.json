@@ -1,11 +1,13 @@
 {
   "name": "a-chat",
-  "version": "1.4.0",
-  "description": "A-Chat — a WhatsApp-style realtime chat web app with accounts, rooms, groups, photos, voice notes and reactions",
+  "version": "1.4.1",
+  "description": "A-Chat \u2014 a WhatsApp-style realtime chat web app with accounts, rooms, groups, photos, voice notes and reactions",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node scripts/smoke-test.js"
+    "test": "node scripts/smoke-test.js",
+    "test:ui": "node scripts/ui-test.js",
+    "test:all": "node scripts/smoke-test.js && node scripts/ui-test.js"
   },
   "engines": {
     "node": ">=20"
@@ -13,5 +15,8 @@
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
   }
 }

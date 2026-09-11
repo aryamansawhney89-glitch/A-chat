@@ -13,6 +13,8 @@
  * Extended in v1.4 with: disappearing messages, delete-for-me, pinned chats,
  * starred messages, mentions, stickers/GIFs, status stories, polls,
  * forwarding, search, admin controls, push, retention/export, 2FA.
+ * v1.4.1 adds GET /api/gifs — a cached GIF search proxy (GIPHY, with Klipy and the
+ * retired Tenor API as fallbacks) behind the picker, so no key ships to the browser.
  */
 
 const path = require('path');
@@ -2043,6 +2045,264 @@ app.get('/api/statuses', (req, res) => {
 });
 app.get('/api/vapidPublicKey', (_req, res) => {
   res.json({ ok: true, publicKey: 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U' });
+});
+
+/* -------------------------------- GIF search --------------------------------
+ * The GIF picker used to filter eight hard-coded Giphy URLs client-side, so
+ * almost any query came back empty. This endpoint does a real search server-side
+ * instead, which also keeps the provider key off the wire:
+ *   GET /api/gifs?q=thumbs up&limit=24
+ *     -> { ok, source, attribution, q, results: [{id,url,previewUrl,w,h,alt}] }
+ *
+ * Provider chain — every name in GIF_PROVIDERS is tried in order and the first one
+ * that answers wins. GIPHY leads because Google discontinued the public Tenor API
+ * on 2026-06-30 (no new keys since 2026-01-13): a Tenor key issued before then
+ * still works and stays supported, but it can't be the default for a fresh deploy.
+ * Klipy is the other free option and is skipped until KLIPY_API_KEY is set.
+ *
+ * Results are cached in memory for 5 minutes, and if every provider is down a
+ * stale cache entry is still served; a hard failure answers 502 so the client can
+ * fall back to its built-in list. Without keys the shared public beta keys are
+ * used (rate limited, can come back empty) — set GIPHY_API_KEY on Render for
+ * anything beyond a demo.
+ */
+
+const GIF_PROVIDER_NAMES = String(process.env.GIF_PROVIDERS || 'giphy,klipy,tenor')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+const GIF_TIMEOUT_MS = Math.max(500, Number(process.env.GIF_TIMEOUT_MS) || 4000);
+const GIF_CACHE_TTL_MS = Math.max(1000, Number(process.env.GIF_CACHE_TTL_MS) || 5 * 60 * 1000);
+const GIF_CACHE_MAX = 200;
+const GIF_MAX_RESULTS = 50;
+// Same shape the client may send as a gif message (see sanitizeMedia): an https
+// image URL. Anything else (mp4/webm renditions, javascript: urls) never reaches
+// the chat, so the picker can't offer a GIF that would silently fail to send.
+const GIF_URL_RE = /^https:\/\/.+\.(?:gif|webp|png|jpe?g)(?:\?.*)?$/i;
+const gifCache = new Map();
+
+function gifNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(4096, Math.round(n))) : undefined;
+}
+
+function gifAlt(text) {
+  const alt = String(text || '').replace(/\s+/g, ' ').trim();
+  return (alt || 'GIF').slice(0, 120);
+}
+
+function gifEntry(id, url, w, h, alt) {
+  if (typeof url !== 'string' || !GIF_URL_RE.test(url)) return null;
+  return { id: String(id), url: url.slice(0, 500), previewUrl: url.slice(0, 500), w: gifNum(w), h: gifNum(h), alt: gifAlt(alt) };
+}
+
+// First rendition present in `order`, from a { name: {url,width,height} } map.
+function gifPickFormats(map, order) {
+  for (const key of order) {
+    const fmt = map && map[key];
+    if (fmt && typeof fmt.url === 'string' && GIF_URL_RE.test(fmt.url)) return fmt;
+  }
+  return null;
+}
+
+/* Tenor: v1 (demo key) hands back `media: [{ tinygif: {url,dims:{width,height}} }]`,
+   v2 hands back `media_formats: { tinygif: {url,dims:{w,h}} }`. Flatten both. */
+function collectTenorFormats(item) {
+  const out = {};
+  const eat = (src) => {
+    if (!src || typeof src !== 'object') return;
+    for (const [name, fmt] of Object.entries(src)) {
+      if (!fmt || typeof fmt !== 'object' || typeof fmt.url !== 'string') continue;
+      if (out[name] || !GIF_URL_RE.test(fmt.url)) continue;
+      const dims = fmt.dims || {};
+      out[name] = { url: fmt.url, w: dims.w !== undefined ? dims.w : dims.width, h: dims.h !== undefined ? dims.h : dims.height };
+    }
+  };
+  eat(item.media_formats);
+  if (Array.isArray(item.media)) for (const m of item.media) eat(m);
+  if (!out.gif && typeof item.url === 'string' && GIF_URL_RE.test(item.url)) out.gif = { url: item.url };
+  return out;
+}
+
+const GIF_PROVIDER_IMPLS = {
+  giphy: {
+    attribution: 'Powered by GIPHY',
+    url(q, limit) {
+      const params = new URLSearchParams({
+        api_key: process.env.GIPHY_API_KEY || 'dc6zaTOxFJmzC', // shared public beta key
+        limit: String(limit),
+        rating: process.env.GIPHY_RATING || 'pg-13',
+      });
+      if (q) params.set('q', q);
+      const base = process.env.GIPHY_API_BASE || 'https://api.giphy.com/v1/gifs';
+      return `${base}/${q ? 'search' : 'trending'}?${params}`;
+    },
+    parse(json) {
+      const items = Array.isArray(json && json.data) ? json.data : [];
+      const out = [];
+      for (const item of items) {
+        if (!item || typeof item !== 'object') continue;
+        const imgs = item.images || {};
+        const full = gifPickFormats(imgs, ['fixed_width_downsampled', 'fixed_width', 'downsized', 'original', 'fixed_height']);
+        if (!full) continue;
+        const entry = gifEntry(item.id, full.url, full.width, full.height, item.title || item.slug);
+        if (!entry) continue;
+        const small = gifPickFormats(imgs, ['fixed_width_small_downsampled', 'fixed_width_small', 'downsized_small', 'preview_gif', 'grid_16x9_roundcorr']);
+        if (small) entry.previewUrl = small.url.slice(0, 500);
+        out.push(entry);
+        if (out.length >= GIF_MAX_RESULTS) break;
+      }
+      return out;
+    },
+  },
+
+  klipy: {
+    attribution: 'Powered by KLIPY',
+    // No free-for-all demo key here — skip quietly until one is configured.
+    enabled() { return !!process.env.KLIPY_API_KEY || !!process.env.KLIPY_API_BASE; },
+    url(q, limit) {
+      const key = process.env.KLIPY_API_KEY;
+      if (!key && !process.env.KLIPY_API_BASE) throw new Error('KLIPY_API_KEY not set');
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (q) params.set('q', q);
+      const base = process.env.KLIPY_API_BASE || 'https://api.klipy.com/api/v1';
+      return `${base}/${key ? encodeURIComponent(key) : 'test'}/gifs/${q ? 'search' : 'trending'}?${params}`;
+    },
+    parse(json) {
+      const items = Array.isArray(json && json.results) ? json.results : [];
+      const pick = (files, sizes) => {
+        for (const size of sizes) {
+          const hit = files.find((f) => f && typeof f.url === 'string' && GIF_URL_RE.test(f.url) && (f.format === 'gif' || !f.format) && f.size === size);
+          if (hit) return hit;
+        }
+        return files.find((f) => f && typeof f.url === 'string' && GIF_URL_RE.test(f.url) && (f.format === 'gif' || !f.format)) || null;
+      };
+      const out = [];
+      for (const item of items) {
+        const files = Array.isArray(item && item.files) ? item.files : [];
+        if (!files.length) continue;
+        const full = pick(files, ['medium', 'large', 'small']);
+        if (!full) continue;
+        const entry = gifEntry(item.slug || item.id, full.url, full.width, full.height, item.title || item.name);
+        if (!entry) continue;
+        const small = pick(files, ['small', 'medium']) || full;
+        entry.previewUrl = small.url.slice(0, 500);
+        out.push(entry);
+        if (out.length >= GIF_MAX_RESULTS) break;
+      }
+      return out;
+    },
+  },
+
+  tenor: {
+    attribution: 'Powered by Tenor',
+    url(q, limit) {
+      const key = process.env.TENOR_API_KEY || 'LIVDSRZULELA'; // legacy public demo key
+      // Keys issued after the 2026-06-30 shutdown do not exist; new ones were
+      // never available, so the v2 API is only used when a key is supplied.
+      const base = process.env.TENOR_API_BASE
+        || (process.env.TENOR_API_KEY ? 'https://tenor.googleapis.com/v2' : 'https://g.tenor.com/v1');
+      const params = new URLSearchParams({
+        key,
+        limit: String(limit),
+        contentfilter: process.env.TENOR_CONTENT_FILTER || 'medium',
+        media_filter: 'tinygif,nanogif,mediumgif,gif',
+        client_key: 'a-chat',
+      });
+      if (q) params.set('q', q);
+      // v2 dropped /trending in favour of /featured?type=trending
+      const isV2 = /\/v2$/.test(base);
+      if (!q && isV2) params.set('type', 'trending');
+      return `${base}/${q ? 'search' : isV2 ? 'featured' : 'trending'}?${params}`;
+    },
+    parse(json) {
+      const items = Array.isArray(json && json.results) ? json.results : [];
+      const out = [];
+      for (const item of items) {
+        if (!item || typeof item !== 'object') continue;
+        const formats = collectTenorFormats(item);
+        const full = gifPickFormats(formats, ['mediumgif', 'gif', 'tinygif', 'nanogif']) || formats.gif;
+        if (!full) continue;
+        const entry = gifEntry(item.id, full.url, full.w, full.h, item.content_description || item.title);
+        if (!entry) continue;
+        const small = gifPickFormats(formats, ['nanogif', 'tinygif', 'mediumgif']);
+        if (small) entry.previewUrl = small.url.slice(0, 500);
+        out.push(entry);
+        if (out.length >= GIF_MAX_RESULTS) break;
+      }
+      return out;
+    },
+  },
+};
+
+async function fetchGifJson(url) {
+  if (typeof fetch !== 'function') throw new Error('fetch unavailable on this runtime');
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), GIF_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: ac.signal,
+      headers: { accept: 'application/json', 'user-agent': 'A-Chat/' + APP_VERSION },
+    });
+    if (!res.ok) throw new Error(`responded ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(`timed out after ${GIF_TIMEOUT_MS}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// First provider with usable results wins; failures are collected for the log line.
+async function searchGifs(query, limit) {
+  const problems = [];
+  for (const name of GIF_PROVIDER_NAMES) {
+    const provider = GIF_PROVIDER_IMPLS[name];
+    if (!provider) { problems.push(`${name}: unknown provider`); continue; }
+    if (provider.enabled && !provider.enabled()) continue;
+    let url;
+    try {
+      url = provider.url(query, limit);
+    } catch (e) {
+      problems.push(`${name}: ${e.message}`);
+      continue;
+    }
+    try {
+      const results = provider.parse(await fetchGifJson(url));
+      if (!results.length) throw new Error('no usable GIF results');
+      return { results, source: name, attribution: provider.attribution };
+    } catch (e) {
+      problems.push(`${name}: ${e.message}`);
+    }
+  }
+  throw new Error(problems.length ? problems.join('; ') : 'no GIF providers configured');
+}
+
+app.get('/api/gifs', async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 100);
+  const limit = Math.min(GIF_MAX_RESULTS, Math.max(1, Number(req.query.limit) || 24));
+  const cacheKey = `${q.toLowerCase()}|${limit}`;
+  const hit = gifCache.get(cacheKey);
+
+  if (hit && Date.now() - hit.at < GIF_CACHE_TTL_MS) {
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.json({ ok: true, ...hit.payload, q, cached: true });
+  }
+  try {
+    const { results, source, attribution } = await searchGifs(q, limit);
+    const payload = { ok: true, source, attribution, results };
+    if (gifCache.size >= GIF_CACHE_MAX) gifCache.delete(gifCache.keys().next().value);
+    gifCache.set(cacheKey, { at: Date.now(), payload });
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json({ ...payload, q });
+  } catch (e) {
+    if (hit) {
+      // every provider is unhappy but we have something — better than nothing
+      res.set('Cache-Control', 'no-store');
+      return res.json({ ...hit.payload, source: hit.payload.source + ' (stale cache)', q });
+    }
+    console.log(`[gifs] ${e.message}`);
+    res.status(502).json({ ok: false, error: 'GIF providers unavailable', q, results: [] });
+  }
 });
 
 const UPLOAD_TYPES = {

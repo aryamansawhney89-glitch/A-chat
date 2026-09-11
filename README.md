@@ -52,6 +52,22 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
   offline — you can still read, reply and place calls). Settings persist per
   account in `data/users.json` and survive restarts; a 👻 badge shows next to your
   name while ghosting
+- **GIF picker with real search 🎞️** — the 🎭 button opens the panel on the GIF tab;
+  typing is debounced and hits `GET /api/gifs`, which proxies a real GIF provider
+  (GIPHY by default, Klipy and the retired Tenor API as fallbacks). Shows "Searching…"
+  and "No GIFs found" states, an empty search shows trending GIFs, and if every
+  provider is unreachable it falls back to a built-in list so the panel is never dead
+- **Polls 📊** — 📊 in the composer opens a create dialog (question, up to 4 options,
+  allow-multiple). The card in the chat shows a header, ○/● (or ☐/☑) per option, the
+  percentage and a live bar for each, the per-option tally, a total vote count and — for
+  the author or a group admin — a Close poll button; tapping your option again removes
+  your vote, and voting/closing broadcasts to everyone in the chat. Needs an open chat
+  (the button tells you "Open a chat first" otherwise)
+- **Chat header menu ⋮** — Search in chat, Pin, Mute, Disappearing messages, Wallpaper
+  and Clear chat in one dropdown (labels reflect current state); ↗️ forwards the newest
+  message of the open chat (long-press any bubble to forward a specific one); 🔍 opens
+  in-chat search, which filters as you type — including inside poll cards — and restores
+  the full list when you close it
 - **Typing indicators** and **online / last-seen presence** (per chat and per member in groups)
 - **Unread badges** (sidebar + browser tab title)
 - **Emoji picker**, auto-growing composer, Enter-to-send
@@ -68,6 +84,18 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 - **Upload API** — `POST /api/upload` accepts base64 data URLs (images + audio,
   8 MB cap, MIME parameters such as `codecs=opus` tolerated) and returns a
   `/uploads/...` URL served with the correct `Content-Type` and byte-range support
+- **GIF search API** — `GET /api/gifs?q=<query>&limit=<1..50>` walks the provider
+  chain in `GIF_PROVIDERS` (default `giphy,klipy,tenor`) and returns the first
+  provider's normalised results: `{ ok, source, attribution, results: [{url,
+  previewUrl, w, h, alt}] }`. `q` searches, no `q` trends. Keys stay server-side,
+  results are cached in memory for 5 minutes (a stale entry is served if every
+  provider goes down) and a total failure answers `502 {ok:false,results:[]}` so the
+  picker can fall back to its built-in list. Only `https` image URLs are passed
+  through — the same rule the message sanitizer applies to `kind:"gif"`, so the
+  picker can never offer a GIF that would fail to send.
+  **Heads-up on Tenor:** Google closed the public Tenor API on 2026-06-30 (no new
+  keys since 2026-01-13), so Tenor is kept only as a legacy fallback for keys issued
+  before that; GIPHY (free instant beta key) is the default provider
 
 ## Run it locally
 
@@ -85,10 +113,20 @@ sending a photo with 📎, recording a 🎤 voice note, or placing a 📞 voice 
 (Allow camera and microphone access; calls are peer-to-peer over WebRTC with STUN, so
 they work on the same machine/network and across typical NATs.)
 
-### Smoke test
+### Tests
+
+Both suites run offline (stub GIF providers, no network) and both exit non-zero on
+failure. They need `npm install` first; the UI one uses jsdom from `devDependencies`.
 
 ```bash
-npm test         # two WebSocket clients exercise DMs, groups, receipts, uploads
+npm test           # protocol + persistence: two WebSocket clients and raw HTTP calls
+                   # against a scratch server — DMs, groups, rooms, receipts, uploads,
+                   # calls, reactions, edits/deletes, privacy/ghost mode, the GIF
+                   # provider chain, polls and forwarding (160 assertions)
+npm run test:ui    # the client itself, driven in jsdom: button handlers, panel
+                   # toggles, rendered poll/GIF markup, debounced GIF search and its
+                   # fallbacks (73 assertions). UI_TEST_VERBOSE=1 for server logs
+npm run test:all   # both
 ```
 
 ## Deploy it (free, ~3 minutes)
@@ -130,7 +168,15 @@ Start `npm start`, Plan **Free** → **Deploy**.
 - The client talks to the server over the same host/port (`ws://`/`wss://`), so it
   works behind any reverse proxy without extra config.
 - `scripts/smoke-test.js` — end-to-end test that runs a scratch server and drives it
-  with two WebSocket clients.
+  with two WebSocket clients plus HTTP calls. `/api/gifs` is covered against stub
+  providers (GIPHY + Tenor shapes, rendition selection, caching, failover,
+  stale-cache and 502 fallback), so `npm test` needs no network access.
+- `scripts/ui-test.js` — loads `public/index.html` + `public/app.js` in jsdom,
+  bridges `window.WebSocket` to a real server and clicks through the UI: the 🎭
+  GIF picker (including the built-in-list fallback), the 📊 poll card and its
+  percentages, and the ↗️ / ⋮ / 🔍 header buttons. Catches the class of bug a
+  protocol test can't see — a button with no handler, a panel that closes itself,
+  a bubble that renders its text twice.
 
 ## Configuration
 
@@ -139,3 +185,12 @@ Start `npm start`, Plan **Free** → **Deploy**.
 | `PORT`               | `3000`  | HTTP/WS port                       |
 | `DATA_DIR`           | `./data`| Where messages/groups/users/uploads live |
 | `CALL_RING_TIMEOUT_MS` | `45000` | How long an unanswered call rings before it is logged as missed |
+| `GIF_PROVIDERS`      | `giphy,klipy,tenor` | Provider chain for `/api/gifs`, tried in order; first one that answers wins |
+| `GIPHY_API_KEY`      | shared public beta key | Your [GIPHY](https://developers.giphy.com/docs/api) key — free and instant, recommended for anything beyond a demo (the shared beta key is capped at ~100 calls/hour) |
+| `GIPHY_RATING`       | `pg-13` | GIPHY content rating (`g`, `pg`, `pg-13`, `r`) |
+| `KLIPY_API_KEY`      | unset | [Klipy](https://docs.klipy.com/) key. Klipy is skipped entirely while this is unset |
+| `TENOR_API_KEY`      | legacy demo key | Tenor key, for the discontinued Tenor API (shut down 2026-06-30); setting one also switches that provider to its v2 endpoint |
+| `TENOR_CONTENT_FILTER` | `medium` | Tenor content filter (`low` / `medium` / `high` / `off`) |
+| `TENOR_API_BASE` / `GIPHY_API_BASE` / `KLIPY_API_BASE` | provider URLs | Override a provider base URL — how `npm test` points the chain at its stub providers |
+| `GIF_TIMEOUT_MS`     | `4000`  | Per-request timeout for each provider call |
+| `GIF_CACHE_TTL_MS`   | `300000` | How long `/api/gifs` results are cached (5 min) |

@@ -5,8 +5,14 @@ services:
     name: a-chat
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install --omit=dev   # jsdom is only needed for `npm run test:ui`
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeploy: true
     branch: main
+    envVars:
+      # Optional. A free key from https://developers.giphy.com (a shared public beta
+      # key is used when this is empty, but it is rate limited to ~100 calls/hour).
+      # GIF search falls back to the built-in list if no provider can be reached.
+      - key: GIPHY_API_KEY
+        value: ""

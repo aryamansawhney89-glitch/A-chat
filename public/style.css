@@ -1556,6 +1556,8 @@ html[data-theme="dark"] .switch { background: #3a4a52; }
 /* Chat header search */
 .chat-header-search { display:flex; gap:8px; padding:8px 12px; background:var(--panel-header); border-bottom:1px solid var(--border); }
 .chat-header-search input { flex:1; padding:8px 12px; border:1px solid var(--border); border-radius:8px; background:var(--input-bg); color:var(--text); outline:none; }
+.chat-header-search input:focus { border-color:var(--accent); }
+.chat-search-empty { margin:18px auto; padding:10px 14px; max-width:70%; text-align:center; font-size:13px; color:var(--text-soft); background:var(--panel-header); border-radius:10px; }
 
 /* Status bar */
 .status-bar { display:flex; gap:10px; padding:8px 10px; overflow-x:auto; border-bottom:1px solid var(--border); background:var(--panel); }
@@ -1579,29 +1581,63 @@ html[data-theme="dark"] .switch { background: #3a4a52; }
 .emoji-tab { flex:1; padding:8px; border:none; background:none; font-size:14px; font-weight:600; cursor:pointer; color:var(--text-soft); }
 .emoji-tab.active { color:var(--accent); border-bottom:2px solid var(--accent); }
 .emoji-tab-content { display:grid; grid-template-columns:repeat(8,1fr); gap:2px; padding:10px; max-height:240px; overflow-y:auto; }
-.gif-tab-content, .sticker-tab-content { padding:10px; max-height:260px; overflow-y:auto; }
-.gif-tab-content input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--input-bg); color:var(--text); margin-bottom:8px; outline:none; }
-.gif-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; }
-.gif-thumb { width:100%; height:90px; object-fit:cover; border-radius:8px; cursor:pointer; background:var(--hover); }
+.gif-tab-content, .sticker-tab-content { padding:10px; max-height:280px; overflow-y:auto; }
+.gif-tab-content input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--input-bg); color:var(--text); margin-bottom:6px; outline:none; }
+.gif-tab-content input:focus { border-color:var(--accent); }
+.gif-status { font-size:11.5px; color:var(--text-soft); margin:0 2px 8px; line-height:1.4; }
+.gif-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; min-height:60px; }
+.gif-thumb { width:100%; height:90px; object-fit:cover; border-radius:8px; cursor:pointer; background:var(--hover); border:1px solid transparent; transition:border-color 0.12s, transform 0.12s; }
+.gif-thumb:hover { border-color:var(--accent); transform:translateY(-1px); }
+.gif-thumb.gif-broken { opacity:0.3; cursor:default; }
+.gif-empty { grid-column:1 / -1; padding:20px 8px; text-align:center; color:var(--text-soft); font-size:12.5px; line-height:1.5; }
+.gif-attr { margin-top:8px; text-align:right; font-size:10px; letter-spacing:0.6px; text-transform:uppercase; color:var(--text-soft); }
 .sticker-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
 .sticker-btn { background:none; border:1px solid var(--border); border-radius:8px; padding:8px; cursor:pointer; }
 .sticker-btn:hover { background:var(--hover); }
 .sticker-img { width:140px; height:140px; object-fit:contain; }
 .forward-label { font-size:11px; color:var(--text-soft); font-style:italic; margin-bottom:4px; border-left:2px solid var(--accent); padding-left:6px; }
 
-/* Poll */
-.poll-wrap { min-width:260px; }
-.poll-question { font-weight:600; margin-bottom:8px; }
-.poll-option { margin:6px 0; }
-.poll-vote-btn { width:100%; text-align:left; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel); color:var(--text); cursor:pointer; font-size:13px; }
-.poll-vote-btn.voted { border-color:var(--accent); background:rgba(0,168,132,0.12); }
-.poll-bar { height:6px; background:var(--border); border-radius:3px; margin:4px 0; overflow:hidden; }
-.poll-fill { height:100%; background:var(--accent); border-radius:3px; transition:width 0.3s; }
+/* Poll — a card inside the bubble. The bubble's plain text is suppressed for
+   kind=poll (buildBubble) so the question isn't shown twice. */
+.bubble.poll-bubble { max-width:min(78%, 420px); }
+/* time/ticks sit on their own row under the card instead of floating next to it */
+.bubble.poll-bubble .meta { float:none; display:flex; justify-content:flex-end; margin:6px 0 -2px; }
+.poll-wrap { min-width:250px; display:flex; flex-direction:column; }
+.poll-head { font-size:10.5px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; color:var(--text-soft); margin-bottom:3px; }
+.poll-question { font-weight:600; font-size:15px; line-height:1.35; margin-bottom:9px; }
+.poll-list { display:flex; flex-direction:column; gap:6px; }
+.poll-option { display:flex; align-items:flex-start; gap:9px; width:100%; text-align:left; padding:8px 10px; border:1px solid var(--border); border-radius:10px; background:var(--hover); color:var(--text); cursor:pointer; font-size:13.5px; font-family:inherit; line-height:1.35; transition:border-color 0.15s, background 0.15s; }
+.poll-option:hover:not(:disabled) { border-color:var(--accent); }
+.poll-option:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.poll-option:disabled { cursor:default; }
+.poll-option.voted { border-color:var(--accent); background:rgba(0,168,132,0.12); }
+html[data-theme="dark"] .poll-option { background:#0b141a; }
+html[data-theme="dark"] .poll-option.voted { background:rgba(0,168,132,0.22); }
+.poll-radio { font-size:14px; line-height:1.3; color:var(--text-soft); flex-shrink:0; }
+.poll-option.voted .poll-radio { color:var(--accent); }
+.poll-body { flex:1; min-width:0; }
+.poll-line { display:flex; align-items:baseline; gap:10px; }
+.poll-opt-text { flex:1; min-width:0; word-break:break-word; }
+.poll-pct { font-size:12px; font-weight:700; color:var(--accent); flex-shrink:0; }
+.poll-bar { display:block; height:6px; background:var(--border); border-radius:3px; margin:5px 0 4px; overflow:hidden; }
+.poll-fill { display:block; height:100%; background:var(--accent); border-radius:3px; transition:width 0.35s ease; }
 .poll-count { font-size:11px; color:var(--text-soft); }
-.poll-closed { font-size:12px; color:var(--text-soft); font-style:italic; margin-top:6px; }
+.poll-foot { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:9px; padding-top:7px; border-top:1px solid var(--border); font-size:11.5px; color:var(--text-soft); }
+.poll-total { font-weight:600; }
+.poll-hint, .poll-closed { font-style:italic; }
+.poll-close-btn { align-self:flex-start; margin-top:9px; font-size:12.5px; padding:6px 10px; }
 .poll-options { display:flex; flex-direction:column; gap:8px; margin:12px 0; }
 .poll-options input { padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--input-bg); color:var(--text); outline:none; }
 .poll-options input:focus { border-color:var(--accent); }
+
+/* ⋮ chat header menu */
+.chat-menu { position:fixed; z-index:92; min-width:224px; max-width:calc(100vw - 16px); background:var(--panel); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); padding:6px; animation:chatMenuIn 0.12s ease-out; }
+@keyframes chatMenuIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+.chat-menu-head { font-size:11px; font-weight:700; color:var(--text-soft); text-transform:uppercase; letter-spacing:0.5px; padding:6px 10px 8px; margin-bottom:4px; border-bottom:1px solid var(--border); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.chat-menu-item { display:flex; align-items:center; gap:10px; width:100%; padding:9px 10px; border:none; background:none; color:var(--text); font-size:13.5px; font-family:inherit; text-align:left; border-radius:8px; cursor:pointer; }
+.chat-menu-item:hover { background:var(--hover); }
+.chat-menu-item .cm-icon { width:18px; text-align:center; font-size:14px; flex-shrink:0; }
+.chat-menu-item.danger { color:#e5533d; }
 
 /* Wallpaper */
 .wallpaper-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
