@@ -1645,3 +1645,8 @@ html[data-theme="dark"] .switch { background: #3a4a52; }
 
 /* Hide/show helpers already defined */
 
+
+/* muted chat */
+#muteChatBtn.active{ background:#2d2f33; border-radius:8px; filter: grayscale(0.2); }
+.icon-btn.active{ background:#2d2f33; }
+.chat-item.muted{ opacity:0.7; }

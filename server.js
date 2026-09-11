@@ -215,11 +215,12 @@ function normalizePrivacy(p) {
 function profileFor(name) {
   let p = profiles.get(name);
   if (!p) {
-    p = { name, pic: null, about: '', privacy: { ...DEFAULT_PRIVACY }, pinnedChats: [], wallpaper: null, twoFA: null };
+    p = { name, pic: null, about: '', privacy: { ...DEFAULT_PRIVACY }, pinnedChats: [], mutedChats: [], wallpaper: null, twoFA: null };
     profiles.set(name, p);
   } else {
     p.privacy = normalizePrivacy(p.privacy);
     if (!Array.isArray(p.pinnedChats)) p.pinnedChats = [];
+    if (!Array.isArray(p.mutedChats)) p.mutedChats = [];
     if (!p.wallpaper) p.wallpaper = null;
     if (!p.twoFA) p.twoFA = null;
   }
@@ -382,6 +383,7 @@ function loadState() {
           about: p.about || '',
           privacy: normalizePrivacy(p.privacy),
           pinnedChats: Array.isArray(p.pinnedChats) ? p.pinnedChats : [],
+          mutedChats: Array.isArray(p.mutedChats) ? p.mutedChats : [],
           wallpaper: p.wallpaper || null,
           twoFA: p.twoFA || null,
         });
@@ -438,7 +440,7 @@ function loadState() {
 
   for (const b of BOTS) {
     const existing = profiles.get(b.name);
-    if (!existing) profiles.set(b.name, { name: b.name, pic: BOT_AVATARS[b.name], about: b.subtitle, privacy: { ...DEFAULT_PRIVACY }, pinnedChats: [], wallpaper: null, twoFA: null });
+    if (!existing) profiles.set(b.name, { name: b.name, pic: BOT_AVATARS[b.name], about: b.subtitle, privacy: { ...DEFAULT_PRIVACY }, pinnedChats: [], mutedChats: [], wallpaper: null, twoFA: null });
     else if (!existing.pic) existing.pic = BOT_AVATARS[b.name];
   }
 
@@ -1018,6 +1020,7 @@ function handle(ws, msg) {
         hasAccount: accounts.has(name.toLowerCase()),
         privacy: pro.privacy,
         pinnedChats: pro.pinnedChats || [],
+        mutedChats: pro.mutedChats || [],
         wallpaper: pro.wallpaper || null,
         statuses: getStatusesForUser(name),
         disappearing: Object.fromEntries(disappearingTimers),
@@ -1394,6 +1397,26 @@ function handle(ws, msg) {
       }
       scheduleSave();
       send(ws, { type: 'pinned_update', pinnedChats: p.pinnedChats });
+      break;
+    }
+
+    case 'mute_set': {
+      const from = ws.userName;
+      const convoId = String(msg.convoId || '');
+      const muted = !!msg.muted;
+      if (!from || !convoId) return;
+      if (!canAccess(convoId, from) && !convoId.startsWith('dm::')) {
+        // allow muting DMs even if not yet created? For DMs, participants are derived from ID, so canAccess checks if group exists; for DMs with unknown user, still allow
+        // fallback: allow if convoId is dm
+      }
+      const p = profileFor(from);
+      if (muted) {
+        if (!p.mutedChats.includes(convoId)) p.mutedChats.push(convoId);
+      } else {
+        p.mutedChats = p.mutedChats.filter(c => c !== convoId);
+      }
+      scheduleSave();
+      send(ws, { type: 'muted_update', convoId, muted, mutedChats: p.mutedChats });
       break;
     }
 

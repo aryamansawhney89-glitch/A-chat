@@ -58,6 +58,7 @@ const state = {
   privacy: { readReceipts: true, lastSeen: true, typing: true, ghost: false },
   // new features
   pinnedChats: [],
+  mutedChats: [],
   wallpaper: null,
   disappearing: new Map(), // convoId -> seconds
   statuses: [], // [{id,from,text,media,ts,expiresAt,views}]
@@ -390,6 +391,7 @@ function handle(msg) {
         state.privacy = { ...state.privacy, ...msg.privacy };
       }
       if (Array.isArray(msg.pinnedChats)) state.pinnedChats = msg.pinnedChats;
+      if (Array.isArray(msg.mutedChats)) state.mutedChats = msg.mutedChats;
       if (msg.wallpaper) { state.wallpaper = msg.wallpaper; applyWallpaper(msg.wallpaper); }
       if (msg.statuses) { state.statuses = msg.statuses; renderStatuses(); }
       if (msg.disappearing) { state.disappearing = new Map(Object.entries(msg.disappearing)); }
@@ -415,6 +417,19 @@ function handle(msg) {
     case 'pinned_update': {
       state.pinnedChats = msg.pinnedChats || [];
       renderChatList();
+      break;
+    }
+    case 'muted_update': {
+      if (Array.isArray(msg.mutedChats)) state.mutedChats = msg.mutedChats;
+      else if (msg.convoId) {
+        if (msg.muted) {
+          if (!state.mutedChats.includes(msg.convoId)) state.mutedChats.push(msg.convoId);
+        } else {
+          state.mutedChats = state.mutedChats.filter(c=>c!==msg.convoId);
+        }
+      }
+      renderChatList();
+      updateMuteUI();
       break;
     }
     case 'disappearing_all': {
@@ -480,9 +495,9 @@ function handle(msg) {
       const chat = getChat(msg.convoId);
       chat.unread = (chat.unread||0)+1;
       renderChatList();
-      toast(`💬 ${msg.from} mentioned you`);
+      if (!isMuted(msg.convoId)) toast(`💬 ${msg.from} mentioned you`);
       // per-chat mention indicator via preview
-      if (Notification && Notification.permission==='granted' && document.hidden) {
+      if (!isMuted(msg.convoId) && Notification && Notification.permission==='granted' && document.hidden) {
         try { new Notification(`@${msg.from} mentioned you`, { body: 'in '+msg.convoId, icon: '/avatars/aria.svg' }); } catch {}
       }
       break;
@@ -629,8 +644,10 @@ function handle(msg) {
         chat.unread++;
       }
 
-      if (m.from === state.me) pop(520);
-      else if (m.convoId !== state.active || !document.hasFocus()) pop(880);
+      if (!isMuted(m.convoId)) {
+        if (m.from === state.me) pop(520);
+        else if (m.convoId !== state.active || !document.hasFocus()) pop(880);
+      }
 
       renderChatList();
       updateTitleBadge();
@@ -880,6 +897,9 @@ function hasStarred(convoId) {
   const chat = getChat(convoId);
   return chat.messages.some(m => (m.starredBy||[]).includes(state.me));
 }
+function isMuted(convoId) {
+  return (state.mutedChats||[]).includes(convoId);
+}
 
 
 function previewText(m) {
@@ -936,7 +956,7 @@ function renderChatList() {
     const isGroup = !!c.group;
     const isRoom = !!c.room;
     const item = document.createElement('div');
-    item.className = 'chat-item' + (c.id === state.active ? ' active' : '');
+    item.className = 'chat-item' + (c.id === state.active ? ' active' : '') + (isMuted(c.id) ? ' muted' : '');
     item.addEventListener('click', () => openChat(c.id));
 
     const av = document.createElement('div');
@@ -972,6 +992,13 @@ function renderChatList() {
       pin.textContent = ' 📌';
       pin.style.fontSize='11px';
       nameEl.appendChild(pin);
+    }
+    if (isMuted(c.id)) {
+      const muted = document.createElement('span');
+      muted.textContent = ' 🔇';
+      muted.style.fontSize='11px';
+      muted.title = 'Muted';
+      nameEl.appendChild(muted);
     }
     if (hasMention(c.id)) {
       const mt = document.createElement('span');
@@ -1063,6 +1090,7 @@ function openChat(convoId) {
   renderChatList();
   updateTitleBadge();
   updateDisappearingUI();
+  updateMuteUI();
   msgInput.focus();
 }
 
@@ -3567,6 +3595,28 @@ function togglePinChat(){
   wsSend({ type:'pin_chat', convoId: state.active, pinned: !isPinned });
   toast(isPinned? 'Unpinned 📌':'Pinned 📌');
 }
+function updateMuteUI(){
+  const btn=$('muteChatBtn');
+  if (!btn || !state.active) return;
+  const muted=isMuted(state.active);
+  btn.textContent = muted ? '🔇' : '🔔';
+  btn.title = muted ? 'Unmute notifications' : 'Mute notifications';
+  btn.classList.toggle('active', muted);
+}
+function toggleMuteChat(){
+  if (!state.active) return;
+  const muted=isMuted(state.active);
+  wsSend({ type:'mute_set', convoId: state.active, muted: !muted });
+  toast(!muted ? '🔇 Muted — notifications off for this chat' : '🔔 Unmuted');
+  // optimistic update
+  if (!muted) {
+    if (!state.mutedChats.includes(state.active)) state.mutedChats.push(state.active);
+  } else {
+    state.mutedChats = state.mutedChats.filter(c=>c!==state.active);
+  }
+  renderChatList();
+  updateMuteUI();
+}
 function clearChat(){
   if (!state.active) return;
   if (!confirm('Clear chat for you only? This hides all messages.')) return;
@@ -3696,6 +3746,7 @@ $('deleteAccountBtn')?.addEventListener('click', ()=>{
 $('requestResetBtn')?.addEventListener('click', ()=>wsSend({type:'password_reset_request', username: state.me}));
 $('doResetBtn')?.addEventListener('click', ()=>wsSend({type:'password_reset', token:$('resetTokenInput').value.trim(), password:$('resetNewPw').value}));
 $('pinChatBtn')?.addEventListener('click', togglePinChat);
+$('muteChatBtn')?.addEventListener('click', toggleMuteChat);
 $('clearChatBtn')?.addEventListener('click', clearChat);
 $('disappearingBtn')?.addEventListener('click', openDisappearingModal);
 $('disappearingCloseBtn')?.addEventListener('click', ()=>$('disappearingModal').classList.add('hidden'));
