@@ -113,12 +113,20 @@ sending a photo with 📎, recording a 🎤 voice note, or placing a 📞 voice 
 (Allow camera and microphone access; calls are peer-to-peer over WebRTC with STUN, so
 they work on the same machine/network and across typical NATs.)
 
-### Smoke test
+### Tests
+
+Both suites run offline (stub GIF providers, no network) and both exit non-zero on
+failure. They need `npm install` first; the UI one uses jsdom from `devDependencies`.
 
 ```bash
-npm test         # WebSocket clients + HTTP calls exercise DMs, groups, receipts,
-                 # uploads, calls, privacy/ghost mode, the GIF proxy (stubbed
-                 # provider), polls and forwarding — 155 assertions, no network
+npm test           # protocol + persistence: two WebSocket clients and raw HTTP calls
+                   # against a scratch server — DMs, groups, rooms, receipts, uploads,
+                   # calls, reactions, edits/deletes, privacy/ghost mode, the GIF
+                   # provider chain, polls and forwarding (160 assertions)
+npm run test:ui    # the client itself, driven in jsdom: button handlers, panel
+                   # toggles, rendered poll/GIF markup, debounced GIF search and its
+                   # fallbacks (73 assertions). UI_TEST_VERBOSE=1 for server logs
+npm run test:all   # both
 ```
 
 ## Deploy it (free, ~3 minutes)
@@ -160,9 +168,15 @@ Start `npm start`, Plan **Free** → **Deploy**.
 - The client talks to the server over the same host/port (`ws://`/`wss://`), so it
   works behind any reverse proxy without extra config.
 - `scripts/smoke-test.js` — end-to-end test that runs a scratch server and drives it
-  with two WebSocket clients plus HTTP calls. `/api/gifs` is covered against a stub
-  Tenor provider (both payload shapes, format selection, cache hit, stale-cache and
-  502 fallback), so `npm test` needs no network access.
+  with two WebSocket clients plus HTTP calls. `/api/gifs` is covered against stub
+  providers (GIPHY + Tenor shapes, rendition selection, caching, failover,
+  stale-cache and 502 fallback), so `npm test` needs no network access.
+- `scripts/ui-test.js` — loads `public/index.html` + `public/app.js` in jsdom,
+  bridges `window.WebSocket` to a real server and clicks through the UI: the 🎭
+  GIF picker (including the built-in-list fallback), the 📊 poll card and its
+  percentages, and the ↗️ / ⋮ / 🔍 header buttons. Catches the class of bug a
+  protocol test can't see — a button with no handler, a panel that closes itself,
+  a bubble that renders its text twice.
 
 ## Configuration
 

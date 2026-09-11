@@ -5,7 +5,7 @@ services:
     name: a-chat
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install --omit=dev   # jsdom is only needed for `npm run test:ui`
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeploy: true
