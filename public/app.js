@@ -217,6 +217,19 @@ function sendRead(convoId) {
   wsSend({ type: 'read', convoId });
 }
 
+// If the server has been redeployed with a newer build than the one this tab loaded,
+// reload once so users never sit on a stale UI.
+function checkBuild() {
+  fetch('/api/version', { cache: 'no-store' }).then(r => r.json()).then(v => {
+    if (window.APP_BUILD && v.build && v.build !== window.APP_BUILD && window.APP_BUILD !== '__BUILD__') {
+      const key = 'reloadedForBuild';
+      if (sessionStorage.getItem(key) !== v.build) { sessionStorage.setItem(key, v.build); location.reload(); }
+    }
+  }).catch(() => {});
+}
+checkBuild();
+setInterval(checkBuild, 60000);
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   state.ws = new WebSocket(`${proto}://${location.host}`);
